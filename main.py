@@ -58,20 +58,17 @@ app = FastAPI(
 
 # ── CORS: permitir consumo desde el Desk desplegado en Vercel ──
 ALLOWED_ORIGINS = [
-    "https://ateneadesk.vercel.app",
-    "https://ateneadesk-atenea-lab.vercel.app",
-    "http://localhost:3000",       # desarrollo local Desk
-    "http://localhost:5173",       # Vite default
-    "http://127.0.0.1:3000",
-    "http://127.0.0.1:5173",
+    "https://app.atenealabmx.com",
+    "http://localhost:5173",  # Para desarrollo local
+    "https://ateneadesk.vercel.app" # Por si acaso
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ── Rate Limiter: 20 req/min por IP (mismo patrón que flask-limiter en main.py) ──
