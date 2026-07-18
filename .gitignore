@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.db
+firebase-admin-key.json
+atenea-lab-b86ca-firebase-adminsdk*.json

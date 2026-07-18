@@ -1,0 +1,62 @@
+[
+  {
+    "id": "NOM-001-STPS-2008",
+    "nombre": "Edificios, locales, instalaciones y áreas en los centros de trabajo — Condiciones de seguridad",
+    "aplicacion": "Todos los centros de trabajo en territorio nacional",
+    "puntos_criticos_resumen": "Condiciones de seguridad en techos, paredes, pisos, escaleras, rampas, puertas, salidas de emergencia, orden y limpieza, señalización de seguridad, iluminación, ventilación, instalaciones eléctricas, protección contra incendios, rutas de evacuación."
+  },
+  {
+    "id": "NOM-002-STPS-2010",
+    "nombre": "Prevención y protección contra incendios en los centros de trabajo",
+    "aplicacion": "Centros de trabajo con riesgo de incendio",
+    "puntos_criticos_resumen": "Clasificación de riesgo de incendio (ordinario/alto), extintores portátiles y fijos, sistemas de detección y alarma, brigadas contra incendio, planes de emergencia, simulacros anuales, capacitación del personal, almacenamiento de materiales inflamables, distancias de seguridad."
+  },
+  {
+    "id": "NOM-004-STPS-1999",
+    "nombre": "Sistemas de protección y dispositivos de seguridad en maquinaria y equipo",
+    "aplicacion": "Centros de trabajo que utilicen maquinaria y equipo",
+    "puntos_criticos_resumen": "Protecciones y resguardos en maquinaria, dispositivos de paro de emergencia, mantenimiento preventivo, bloqueo de energía peligrosa, capacitación de operadores, verificaciones periódicas, registros de mantenimiento."
+  },
+  {
+    "id": "NOM-009-STPS-2011",
+    "nombre": "Trabajos en altura — Condiciones de seguridad",
+    "aplicacion": "Actividades a más de 1.8 metros de altura",
+    "puntos_criticos_resumen": "Uso obligatorio de arnés de seguridad y línea de vida, inspección de equipos de protección contra caídas, andamios certificados, plataformas elevadoras, capacitación específica para trabajos en altura, permisos de trabajo, supervisión permanente, rescate en alturas."
+  },
+  {
+    "id": "NOM-017-STPS-2008",
+    "nombre": "Equipo de protección personal — Selección, uso y manejo en los centros de trabajo",
+    "aplicacion": "Todos los centros de trabajo",
+    "puntos_criticos_resumen": "Obligación del patrón de proporcionar EPP gratuito, selección según riesgo (casco, lentes, guantes, calzado, arnés, respiradores), certificación NOM del EPP, capacitación en uso y mantenimiento, registros de entrega, reemplazo cuando esté dañado, sanción por no uso."
+  },
+  {
+    "id": "NOM-019-STPS-2011",
+    "nombre": "Constitución, integración, organización y funcionamiento de las comisiones de seguridad e higiene",
+    "aplicacion": "Centros de trabajo con 15 o más trabajadores",
+    "puntos_criticos_resumen": "Comisión bipartita (igual número representantes obrero-patronales), acta constitutiva ante STPS, recorridos de verificación mensuales (bimestrales si <100 trabajadores), actas de verificación, investigación de accidentes, programa anual de seguridad, coordinador y secretario técnico."
+  },
+  {
+    "id": "NOM-026-STPS-2008",
+    "nombre": "Colores y señales de seguridad e higiene, e identificación de riesgos por fluidos conducidos en tuberías",
+    "aplicacion": "Todos los centros de trabajo",
+    "puntos_criticos_resumen": "Código de colores: rojo (alto/prohibición/equipo contra incendio), amarillo (precaución/riesgo), verde (seguridad/emergencia), azul (obligación), tuberías identificadas por color según fluido (agua, vapor, gases, químicos), señalización de rutas de evacuación, formato normalizado."
+  },
+  {
+    "id": "NOM-029-STPS-2011",
+    "nombre": "Mantenimiento de las instalaciones eléctricas en los centros de trabajo — Condiciones de seguridad",
+    "aplicacion": "Centros de trabajo con instalaciones eléctricas",
+    "puntos_criticos_resumen": "Instalaciones aterrizadas, dispositivos de protección (interruptores termomagnéticos, diferenciales), distancias de seguridad, trabajos con tensión solo por personal calificado, bloqueo/etiquetado (LOTO) obligatorio durante mantenimiento, equipo de protección dieléctrico, registros de mantenimiento."
+  },
+  {
+    "id": "NOM-030-STPS-2009",
+    "nombre": "Servicios preventivos de seguridad y salud en el trabajo — Funciones y actividades",
+    "aplicacion": "Centros de trabajo con 100 o más trabajadores",
+    "puntos_criticos_resumen": "Servicios preventivos internos o externos (médico, higiene, seguridad, ergonomía y psicología), diagnóstico de seguridad y salud, programas preventivos, índices de siniestralidad (frecuencia y gravedad), exámenes médicos ocupacionales, estadísticas de accidentes, informe anual a STPS."
+  },
+  {
+    "id": "NOM-033-STPS-2019",
+    "nombre": "Trabajos en espacios confinados — Condiciones de seguridad",
+    "aplicacion": "Tanques, cisternas, alcantarillas, silos, y otros espacios con ventilación limitada",
+    "puntos_criticos_resumen": "Permiso de entrada obligatorio, medición previa de atmósfera (oxígeno, gases tóxicos, inflamables), ventilación forzada, vigilante externo permanente, equipo de respiración autónoma, arnés con línea de rescate, plan de rescate, capacitación especializada, bloqueo de energías peligrosas."
+  }
+]

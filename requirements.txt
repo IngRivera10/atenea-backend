@@ -1,0 +1,27 @@
+# ============================================================
+# Atenea Chat Backend — requirements.txt
+# FastAPI + Multiagente (Claude/Gemini/DeepSeek)
+# Python >= 3.10
+# ============================================================
+
+# ── Web Framework ──────────────────────────────────────────
+fastapi>=0.115.0
+uvicorn>=0.30.0
+
+# ── AI Providers ───────────────────────────────────────────
+anthropic>=0.18.0       # Claude
+google-genai>=0.3.0     # Gemini (Google Cloud)
+openai>=1.40.0          # DeepSeek (API compatible)
+
+# ── Firebase Admin ─────────────────────────────────────────
+firebase-admin>=6.0.0
+
+# ── Utils ──────────────────────────────────────────────────
+python-dotenv>=1.0.0
+httpx>=0.27.0
+
+# ── Rate Limiting ──────────────────────────────────────────
+slowapi>=0.1.9
+
+# ── OpenRouter / HTTP Client ──────────────────────────────────
+aiohttp>=3.9.0
