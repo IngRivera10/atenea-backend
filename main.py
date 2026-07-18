@@ -144,6 +144,16 @@ async def health():
     }
 
 
+@app.get("/")
+async def root():
+    return {
+        "message": "¡Bienvenido al Cerebro IA de Atenea Lab! 🧠🇲🇽",
+        "status": "online",
+        "version": "1.0.0",
+        "docs": "/docs"
+    }
+
+
 @app.get("/api/agents")
 async def agents_list_endpoint():
     """
