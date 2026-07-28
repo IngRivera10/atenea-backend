@@ -4,5 +4,6 @@ __pycache__/
 .venv/
 venv/
 *.db
+secrets/
 firebase-admin-key.json
 atenea-lab-b86ca-firebase-adminsdk*.json
