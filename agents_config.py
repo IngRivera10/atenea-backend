@@ -6,6 +6,8 @@ DeepSeek V4 Pro es el default por ser el más económico.
 Usado por el orquestador en main.py para enrutar según agent_type.
 """
 
+import os
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SYSTEM PROMPTS POR AGENTE
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -137,16 +139,44 @@ AGENT_TYPE_MAPPING = {
     },
     "glm": {
         "model": "glm",
-        "label": "📋 GLM (Documentos)",
+        "label": "📋 GLM-4 (Documentos)",
         "prompt": AGENT_GLM_PROMPT,
-        "description": "Estructuración Excel, PPT, reportes y manuales",
+        "description": "Estructuración Excel, PPT, reportes y manuales (Premium, 2 créditos)",
         "credits": 2,
+    },
+    "flash": {
+        "model": "flash",
+        "label": "⚡ Flash (Gratis)",
+        "prompt": AGENT_GLM_PROMPT,
+        "description": "Consultas rápidas y soporte de campo vía GLM-4-Flash (GRATIS, 0 créditos)",
+        "credits": 0,
     },
     "hunyuan": {
         "model": "hunyuan",
         "label": "🏢 Hunyuan (Ejecutivo)",
         "prompt": AGENT_HUNYUAN_PROMPT,
         "description": "Presentaciones, ESG, resúmenes ejecutivos",
+        "credits": 2,
+    },
+    "kimi": {
+        "model": "kimi",
+        "label": "💻 Kimi K2.7 Code",
+        "prompt": AGENT_GLM_PROMPT,
+        "description": "Modelo de código y desarrollo avanzado (Kimi K2.7)",
+        "credits": 1,
+    },
+    "minimax": {
+        "model": "minimax",
+        "label": "⚡ Minimax M3",
+        "prompt": AGENT_GLM_PROMPT,
+        "description": "Modelo generalista de alto rendimiento (Minimax M3)",
+        "credits": 1,
+    },
+    "glm52": {
+        "model": "glm52",
+        "label": "🎯 GLM 5.2 Pro",
+        "prompt": AGENT_GLM_PROMPT,
+        "description": "Modelo premium de razonamiento y análisis (GLM 5.2)",
         "credits": 2,
     },
 }
@@ -173,18 +203,144 @@ PROVIDER_CONFIG = {
         "temperature": 0.7,
     },
     "glm": {
-        "model_name": "zhipu/glm-4",
-        "provider": "openrouter",
+        "model_name": "glm-4",
+        "provider": "zhipu_direct",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+        "max_tokens": 2048,
+        "temperature": 0.7,
+    },
+    "flash": {
+        "model_name": "glm-4-flash",
+        "provider": "zhipu_direct",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
         "max_tokens": 2048,
         "temperature": 0.7,
     },
     "hunyuan": {
         "model_name": "tencent/hunyuan-lite",
-        "provider": "openrouter",
+        "provider": "tencent_direct" if os.getenv("TENCENT_API_KEY") else "openrouter",
+        "base_url_direct": "https://api.hunyuan.cloud.tencent.com/v1/chat/completions",
+        "model_direct": "hunyuan-lite",
+        "max_tokens": 2048,
+        "temperature": 0.7,
+    },
+    "kimi": {
+        "model_name": "kimi-k2.7-code",
+        "provider": "zhipu_direct",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+        "max_tokens": 2048,
+        "temperature": 0.7,
+    },
+    "minimax": {
+        "model_name": "minimax-m3",
+        "provider": "zhipu_direct",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+        "max_tokens": 2048,
+        "temperature": 0.7,
+    },
+    "glm52": {
+        "model_name": "glm-5.2",
+        "provider": "zhipu_direct",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
         "max_tokens": 2048,
         "temperature": 0.7,
     },
 }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ZHIPU AI (BigModel) — Conexión directa, sin OpenRouter
+# ═══════════════════════════════════════════════════════════════════════════════
+
+ZHIPU_BASE_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+
+
+async def call_zhipu_direct(model: str, messages: list[dict], system_prompt: str = "") -> dict:
+    """
+    Llama directamente a la API de Zhipu AI (BigModel) usando ZHIPU_API_KEY.
+    Endpoint OpenAI-compatible. Usado por GLM-4 (glm) y GLM-4-Flash (flash).
+
+    Args:
+        model: ID del modelo en Zhipu (ej: "glm-4" o "glm-4-flash").
+        messages: Lista de mensajes [{"role": "user"|"assistant", "content": "..."}].
+        system_prompt: Instrucción de sistema opcional.
+
+    Returns:
+        {
+            "content": str,
+            "model": str,
+            "tokens_entrada": int,
+            "tokens_salida": int,
+            "costo_usd": float,
+            "tiempo_s": float,
+        }
+    """
+    import os
+    import time
+    import aiohttp
+    import logging
+
+    logger = logging.getLogger(__name__)
+    api_key = os.environ.get("ZHIPU_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("ZHIPU_API_KEY no configurada en variables de entorno")
+
+    inicio = time.time()
+
+    # Construir payload OpenAI-compatible
+    openai_messages = []
+    if system_prompt:
+        openai_messages.append({"role": "system", "content": system_prompt})
+    for m in messages:
+        openai_messages.append({"role": m["role"], "content": m["content"]})
+
+    payload = {
+        "model": model,
+        "messages": openai_messages,
+        "max_tokens": 2048,
+        "temperature": 0.7,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                ZHIPU_BASE_URL, json=payload, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    raise RuntimeError(f"Zhipu HTTP {resp.status}: {error_text[:200]}")
+
+                data = await resp.json()
+                duracion = round(time.time() - inicio, 2)
+
+                choice = data.get("choices", [{}])[0]
+                contenido = choice.get("message", {}).get("content", "")
+                uso = data.get("usage", {})
+                tokens_entrada = uso.get("prompt_tokens", 0)
+                tokens_salida = uso.get("completion_tokens", 0)
+
+                logger.info(
+                    "🐉 [ZHIPU] %s | %d in / %d out tokens | %.2fs",
+                    model, tokens_entrada, tokens_salida, duracion,
+                )
+
+                return {
+                    "content": contenido,
+                    "model": model,
+                    "tokens_entrada": tokens_entrada,
+                    "tokens_salida": tokens_salida,
+                    "costo_usd": 0.0,  # Zhipu directo: sin costo de pasarela
+                    "tiempo_s": duracion,
+                }
+
+    except aiohttp.ClientError as e:
+        logger.error("❌ [ZHIPU] Error de conexión: %s", e)
+        raise RuntimeError(f"Zhipu no disponible: {e}") from e
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SISTEMA DE CRÉDITOS

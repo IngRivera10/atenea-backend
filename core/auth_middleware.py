@@ -25,26 +25,55 @@ _firebase_initialized = False
 
 
 def _init_firebase():
-    """Inicializa el Admin SDK usando la variable de entorno GOOGLE_APPLICATION_CREDENTIALS
-    o el archivo de service account del proyecto Firebase."""
+    """Inicializa el Admin SDK. Busca credenciales en este orden:
+    1. FIREBASE_CREDENTIALS_B64 (Render, producción) — pasa dict directo, sin archivo temp
+    2. FIREBASE_SERVICE_ACCOUNT_BASE64 (Render, nombre alternativo)
+    3. FIREBASE_CREDENTIALS (Render, nombre alternativo legacy)
+    4. GOOGLE_APPLICATION_CREDENTIALS (path local)
+    """
     global _firebase_initialized
     if _firebase_initialized:
         return
 
-    cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+    import base64
+    import json
 
-    if cred_path and os.path.isfile(cred_path):
-        cred = firebase_admin.credentials.Certificate(cred_path)
-        logger.info("🔐 Firebase Admin inicializado con: %s", os.path.basename(cred_path))
-    else:
-        # Intentar con credenciales por defecto (Google Cloud environment)
-        logger.warning(
-            "⚠️ GOOGLE_APPLICATION_CREDENTIALS no encontrado en %s. "
-            "Usando credenciales por defecto de Google Cloud.", cred_path
-        )
-        cred = None
+    cred = None
 
-    firebase_admin.initialize_app(cred)
+    # Probar los 3 nombres posibles para base64 inline
+    # Certificate() acepta dict directamente desde firebase-admin>=6
+    for var_name in ["FIREBASE_CREDENTIALS_B64", "FIREBASE_SERVICE_ACCOUNT_BASE64", "FIREBASE_CREDENTIALS"]:
+        creds_b64 = os.environ.get(var_name, "")
+        if creds_b64:
+            try:
+                creds_dict = json.loads(base64.b64decode(creds_b64).decode("utf-8"))
+                cred = firebase_admin.credentials.Certificate(creds_dict)
+                logger.info("🔐 Firebase Admin inicializado desde %s (dict directo)", var_name)
+                break
+            except Exception as e:
+                logger.error("❌ Error decodificando %s: %s", var_name, e)
+
+    # Método 2: GOOGLE_APPLICATION_CREDENTIALS (path de archivo, desarrollo local)
+    if cred is None:
+        cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+        if cred_path and os.path.isfile(cred_path):
+            cred = firebase_admin.credentials.Certificate(cred_path)
+            logger.info("🔐 Firebase Admin inicializado con: %s", os.path.basename(cred_path))
+        else:
+            logger.warning(
+                "⚠️ Ninguna variable de credenciales Firebase configurada correctamente. "
+                "Usando credenciales por defecto de Google Cloud."
+            )
+
+    # Pasar project_id explícitamente como fallback por si el JSON de credenciales
+    # está incompleto o se decodificó mal desde base64 en producción (Render).
+    # [ARCH] El SDK de Firebase Admin extrae project_id del JSON de Certificate()
+    # automáticamente, pero si FIREBASE_CREDENTIALS_B64 contiene un JSON corrupto
+    # sin ese campo, initialize_app() falla con "A project ID is required".
+    # Pasarlo explícitamente como segundo argumento elimina esta dependencia.
+    firebase_admin.initialize_app(cred, {
+        "projectId": "atenea-lab-b86ca",
+    })
     _firebase_initialized = True
 
 

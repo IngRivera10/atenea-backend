@@ -12,6 +12,7 @@ Uso:
 
 import os
 import sys
+import base64
 import time
 import logging
 from datetime import datetime
@@ -32,7 +33,7 @@ load_dotenv()
 
 from core.chat_multiagente import generar_respuesta_chat, llamar_gemini
 from core.auth_middleware import verificar_acceso_premium
-from agents_config import get_agent_config, list_agents, AGENT_DEFAULT_PROMPT, validate_credits, get_agent_credits
+from agents_config import get_agent_config, list_agents, AGENT_DEFAULT_PROMPT, validate_credits, get_agent_credits, PROVIDER_CONFIG, OPENROUTER_BASE_URL, call_zhipu_direct
 from talent_engine import calculate_ipa_components, build_match_prompt, build_skill_validation_prompt, MATCH_SYSTEM_PROMPT, SKILL_VALIDATION_PROMPT, SKILL_CATALOG, TALENT_ROLES
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -101,6 +102,153 @@ MODERATION_RESPONSES = {
     "jailbreak": "Soy un asistente de capacitación de Atenea Lab Desk. Solo puedo ayudarte con dudas sobre el uso de la plataforma.",
     "medical": "No puedo evaluar situaciones reales de seguridad. Si hay un riesgo inminente, sigue tu protocolo de emergencia y contacta a tu supervisor de seguridad.",
 }
+
+
+async def call_glm_direct(prompt: str, agent_config: dict) -> str:
+    """
+    Llama directamente a la API de Zhipu (BigModel) para GLM 5.2 usando GLM_API_KEY.
+
+    Args:
+        prompt: Texto del usuario (último mensaje).
+        agent_config: Configuración del agente GLM (de AGENT_TYPE_MAPPING).
+
+    Returns:
+        str con el contenido de la respuesta del modelo.
+
+    Raises:
+        RuntimeError: si GLM_API_KEY no está configurada o falla la petición.
+    """
+    import os
+    import time
+    import aiohttp
+
+    api_key = os.environ.get("GLM_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("GLM_API_KEY no configurada en variables de entorno")
+
+    glm_provider_cfg = PROVIDER_CONFIG.get("glm", {})
+    base_url_direct = glm_provider_cfg.get(
+        "base_url_direct", "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    )
+    model_name_direct = glm_provider_cfg.get("model_name_direct", "glm-5.2")
+    system_prompt = agent_config.get("prompt", "")
+
+    inicio = time.time()
+    openai_messages = []
+    if system_prompt:
+        openai_messages.append({"role": "system", "content": system_prompt})
+    openai_messages.append({"role": "user", "content": prompt})
+
+    payload = {
+        "model": model_name_direct,
+        "messages": openai_messages,
+        "max_tokens": glm_provider_cfg.get("max_tokens", 2048),
+        "temperature": glm_provider_cfg.get("temperature", 0.7),
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                base_url_direct, json=payload, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    raise RuntimeError(f"GLM Direct HTTP {resp.status}: {error_text[:200]}")
+                data = await resp.json()
+                duracion = round(time.time() - inicio, 2)
+                contenido = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                uso = data.get("usage", {})
+                logger.info(
+                    "🟢 [GLM-DIRECT] %s | %d in / %d out tokens | %.2fs",
+                    model_name_direct,
+                    uso.get("prompt_tokens", 0),
+                    uso.get("completion_tokens", 0),
+                    duracion,
+                )
+                return contenido
+    except aiohttp.ClientError as e:
+        logger.error("❌ [GLM-DIRECT] Error de conexión: %s", e)
+        raise RuntimeError(f"GLM Direct no disponible: {e}") from e
+
+
+async def call_tencent_direct(prompt: str, agent_config: dict) -> str:
+    """
+    Llama directamente a la API de Tencent Cloud (Hunyuan) usando TENCENT_API_KEY.
+    Endpoint OpenAI-compatible. Usado por Hunyuan cuando hay API Key directa.
+
+    Args:
+        prompt: Texto del usuario (último mensaje).
+        agent_config: Configuración del agente Hunyuan (de AGENT_TYPE_MAPPING / PROVIDER_CONFIG).
+
+    Returns:
+        str con el contenido de la respuesta del modelo.
+
+    Raises:
+        RuntimeError: si TENCENT_API_KEY no está configurada o falla la petición.
+    """
+    import os
+    import time
+    import aiohttp
+
+    api_key = os.environ.get("TENCENT_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("TENCENT_API_KEY no configurada en variables de entorno")
+
+    hunyuan_cfg = PROVIDER_CONFIG.get("hunyuan", {})
+    base_url_direct = hunyuan_cfg.get(
+        "base_url_direct", "https://api.hunyuan.cloud.tencent.com/v1/chat/completions"
+    )
+    model_direct = hunyuan_cfg.get("model_direct", "hunyuan-lite")
+    system_prompt = agent_config.get("prompt", "")
+
+    inicio = time.time()
+    openai_messages = []
+    if system_prompt:
+        openai_messages.append({"role": "system", "content": system_prompt})
+    openai_messages.append({"role": "user", "content": prompt})
+
+    payload = {
+        "model": model_direct,
+        "messages": openai_messages,
+        "max_tokens": hunyuan_cfg.get("max_tokens", 2048),
+        "temperature": hunyuan_cfg.get("temperature", 0.7),
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                base_url_direct, json=payload, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    raise RuntimeError(f"Tencent HTTP {resp.status}: {error_text[:200]}")
+                data = await resp.json()
+                duracion = round(time.time() - inicio, 2)
+                contenido = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                uso = data.get("usage", {})
+                logger.info(
+                    "🟣 [TENCENT-DIRECT] %s | %d in / %d out tokens | %.2fs",
+                    model_direct,
+                    uso.get("prompt_tokens", 0),
+                    uso.get("completion_tokens", 0),
+                    duracion,
+                )
+                return contenido
+    except aiohttp.ClientError as e:
+        logger.error("❌ [TENCENT-DIRECT] Error de conexión: %s", e)
+        raise RuntimeError(f"Tencent Direct no disponible: {e}") from e
 
 
 def detectar_categoria_backend(texto: str) -> str | None:
@@ -242,7 +390,7 @@ async def chat_endpoint(
         model = agent_config["model"]
 
     # Validar modelo resultante
-    VALID_MODELS = ("claude", "gemini", "deepseek", "glm", "hunyuan")
+    VALID_MODELS = ("claude", "gemini", "deepseek", "glm", "flash", "hunyuan", "kimi", "minimax", "glm52")
     if model not in VALID_MODELS:
         raise HTTPException(
             status_code=422,
@@ -320,6 +468,48 @@ async def chat_endpoint(
 
     # Invocar al proveedor de IA
     try:
+        # Enrutamiento directo a Zhipu AI (GLM-4, GLM-4-Flash, Kimi, Minimax, GLM 5.2)
+        if agent_type in ("glm", "flash", "kimi", "minimax", "glm52"):
+            zhipu_cfg = PROVIDER_CONFIG.get(agent_type, {})
+            zhipu_model = zhipu_cfg.get("model_name", "glm-4")
+            resultado = await call_zhipu_direct(
+                model=zhipu_model,
+                messages=messages,
+                system_prompt=system_prompt,
+            )
+            duracion_total = round(time.time() - t_inicio, 2)
+            return {
+                "content": resultado["content"],
+                "model": zhipu_model,
+                "tokens_entrada": resultado["tokens_entrada"],
+                "tokens_salida": resultado["tokens_salida"],
+                "costo_usd": 0.0,
+                "tiempo_s": duracion_total,
+            }
+
+        # Enrutamiento directo a Tencent Hunyuan (si hay API Key directa)
+        if agent_type == "hunyuan":
+            hunyuan_cfg = PROVIDER_CONFIG.get("hunyuan", {})
+            if hunyuan_cfg.get("provider") == "tencent_direct":
+                # Extraer el último mensaje de usuario para el prompt
+                prompt = ""
+                for m in reversed(messages):
+                    if m["role"] == "user":
+                        prompt = m["content"]
+                        break
+                contenido = await call_tencent_direct(prompt=prompt, agent_config=agent_config)
+                duracion_total = round(time.time() - t_inicio, 2)
+                return {
+                    "content": contenido,
+                    "model": hunyuan_cfg.get("model_direct", "hunyuan-lite"),
+                    "tokens_entrada": 0,
+                    "tokens_salida": 0,
+                    "costo_usd": 0.0,
+                    "tiempo_s": duracion_total,
+                }
+            # Si no es tencent_direct (openrouter), cae al generar_respuesta_chat
+
+        # Cualquier otro caso (deepseek, claude, gemini, hunyuan→openrouter)
         resultado = await generar_respuesta_chat(
             model=model,
             messages=messages,
@@ -750,4 +940,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
         reload=debug,
-    )
+    )  
