@@ -177,34 +177,32 @@ async def call_glm_direct(prompt: str, agent_config: dict) -> str:
         raise RuntimeError(f"GLM Direct no disponible: {e}") from e
 
 
-async def call_tencent_direct(prompt: str, agent_config: dict) -> str:
+async def call_tokenhub_direct(prompt: str, agent_config: dict) -> str:
     """
-    Llama directamente a la API de Tencent Cloud (Hunyuan) usando TENCENT_API_KEY.
-    Endpoint OpenAI-compatible. Usado por Hunyuan cuando hay API Key directa.
+    Llama directamente a TokenHub (Tencent Cloud MAAS) para Hy3.
+    Chat Completions API estandar. Usa TOKENHUB_API_KEY.
 
     Args:
-        prompt: Texto del usuario (último mensaje).
+        prompt: Texto del usuario (ultimo mensaje).
         agent_config: Configuración del agente Hunyuan (de AGENT_TYPE_MAPPING / PROVIDER_CONFIG).
 
     Returns:
         str con el contenido de la respuesta del modelo.
 
     Raises:
-        RuntimeError: si TENCENT_API_KEY no está configurada o falla la petición.
+        RuntimeError: si TOKENHUB_API_KEY no esta configurada o falla la peticion.
     """
     import os
     import time
     import aiohttp
 
-    api_key = os.environ.get("TENCENT_API_KEY", "")
+    api_key = os.environ.get("TOKENHUB_API_KEY", "")
     if not api_key:
-        raise RuntimeError("TENCENT_API_KEY no configurada en variables de entorno")
+        raise RuntimeError("TOKENHUB_API_KEY no configurada en variables de entorno")
 
-    hunyuan_cfg = PROVIDER_CONFIG.get("hunyuan", {})
-    base_url_direct = hunyuan_cfg.get(
-        "base_url_direct", "https://api.hunyuan.cloud.tencent.com/v1/chat/completions"
-    )
-    model_direct = hunyuan_cfg.get("model_direct", "hunyuan-lite")
+    hy3_cfg = PROVIDER_CONFIG.get("hunyuan", {})
+    base_url = hy3_cfg.get("base_url_direct", "https://tokenhub-intl.tencentcloudmaas.com/v1/chat/completions")
+    model_id = hy3_cfg.get("model_direct", "hy3")
     system_prompt = agent_config.get("prompt", "")
 
     inicio = time.time()
@@ -214,10 +212,10 @@ async def call_tencent_direct(prompt: str, agent_config: dict) -> str:
     openai_messages.append({"role": "user", "content": prompt})
 
     payload = {
-        "model": model_direct,
+        "model": model_id,
         "messages": openai_messages,
-        "max_tokens": hunyuan_cfg.get("max_tokens", 2048),
-        "temperature": hunyuan_cfg.get("temperature", 0.7),
+        "max_tokens": hy3_cfg.get("max_tokens", 2048),
+        "temperature": hy3_cfg.get("temperature", 0.7),
     }
 
     headers = {
@@ -228,27 +226,27 @@ async def call_tencent_direct(prompt: str, agent_config: dict) -> str:
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                base_url_direct, json=payload, headers=headers,
+                base_url, json=payload, headers=headers,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
-                    raise RuntimeError(f"Tencent HTTP {resp.status}: {error_text[:200]}")
+                    raise RuntimeError(f"TokenHub HTTP {resp.status}: {error_text[:200]}")
                 data = await resp.json()
                 duracion = round(time.time() - inicio, 2)
                 contenido = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                 uso = data.get("usage", {})
                 logger.info(
-                    "🟣 [TENCENT-DIRECT] %s | %d in / %d out tokens | %.2fs",
-                    model_direct,
+                    "🟣 [TOKENHUB] %s | %d in / %d out tokens | %.2fs",
+                    model_id,
                     uso.get("prompt_tokens", 0),
                     uso.get("completion_tokens", 0),
                     duracion,
                 )
                 return contenido
     except aiohttp.ClientError as e:
-        logger.error("❌ [TENCENT-DIRECT] Error de conexión: %s", e)
-        raise RuntimeError(f"Tencent Direct no disponible: {e}") from e
+        logger.error("❌ [TOKENHUB] Error de conexión: %s", e)
+        raise RuntimeError(f"TokenHub no disponible: {e}") from e
 
 
 def detectar_categoria_backend(texto: str) -> str | None:
@@ -487,29 +485,26 @@ async def chat_endpoint(
                 "tiempo_s": duracion_total,
             }
 
-        # Enrutamiento directo a Tencent Hunyuan (si hay API Key directa)
+        # Enrutamiento directo a TokenHub (Hy3) — unica ruta valida
         if agent_type == "hunyuan":
-            hunyuan_cfg = PROVIDER_CONFIG.get("hunyuan", {})
-            if hunyuan_cfg.get("provider") == "tencent_direct":
-                # Extraer el último mensaje de usuario para el prompt
-                prompt = ""
-                for m in reversed(messages):
-                    if m["role"] == "user":
-                        prompt = m["content"]
-                        break
-                contenido = await call_tencent_direct(prompt=prompt, agent_config=agent_config)
-                duracion_total = round(time.time() - t_inicio, 2)
-                return {
-                    "content": contenido,
-                    "model": hunyuan_cfg.get("model_direct", "hunyuan-lite"),
-                    "tokens_entrada": 0,
-                    "tokens_salida": 0,
-                    "costo_usd": 0.0,
-                    "tiempo_s": duracion_total,
-                }
-            # Si no es tencent_direct (openrouter), cae al generar_respuesta_chat
+            hy3_cfg = PROVIDER_CONFIG.get("hunyuan", {})
+            prompt = ""
+            for m in reversed(messages):
+                if m["role"] == "user":
+                    prompt = m["content"]
+                    break
+            contenido = await call_tokenhub_direct(prompt=prompt, agent_config=agent_config)
+            duracion_total = round(time.time() - t_inicio, 2)
+            return {
+                "content": contenido,
+                "model": hy3_cfg.get("model_direct", "hy3"),
+                "tokens_entrada": 0,
+                "tokens_salida": 0,
+                "costo_usd": 0.0,
+                "tiempo_s": duracion_total,
+            }
 
-        # Cualquier otro caso (deepseek, claude, gemini, hunyuan→openrouter)
+        # Cualquier otro caso (deepseek, claude, gemini)
         resultado = await generar_respuesta_chat(
             model=model,
             messages=messages,
