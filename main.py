@@ -1,1261 +1,939 @@
-import sys
+"""
+main.py — Entrypoint del backend de chat multiagente de Atenea Lab.
+
+FastAPI + Uvicorn. Endpoints:
+  - GET  /health          → Health check
+  - POST /api/chat        → Chat multiagente (Claude/Gemini/DeepSeek) — requiere auth Premium
+
+Uso:
+  uvicorn main:app --host 0.0.0.0 --port 8000
+  uvicorn main:app --host 0.0.0.0 --port 8000 --reload   # desarrollo
+"""
+
 import os
-import logging
-import json
-import sqlite3
-import hashlib
-import threading
+import sys
+import base64
 import time
-import re
-import random
-import secrets
-import tempfile
+import logging
 from datetime import datetime
-from flask import Flask, jsonify, request, render_template
-from flask_cors import CORS
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
-import anthropic
-import uuid
-from abogado_stps import generar_dictamen_legal
-from auth_service import token_requerido
-from clasificador_psicosocial import evaluar, prep_legal, reporte as reporte_nom035
 
-# ==========================================
-# CONFIGURACIÓN BASE
-# ==========================================
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from fastapi import FastAPI, Request, Depends, HTTPException, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from dotenv import load_dotenv
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
+# Asegurar que core/ está en el path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Cargar variables de entorno desde .env (solo en desarrollo local)
+load_dotenv()
+
+from core.chat_multiagente import generar_respuesta_chat, llamar_gemini
+from core.auth_middleware import verificar_acceso_premium
+from agents_config import get_agent_config, list_agents, AGENT_DEFAULT_PROMPT, validate_credits, get_agent_credits, PROVIDER_CONFIG, OPENROUTER_BASE_URL, call_zhipu_direct
+from talent_engine import calculate_ipa_components, build_match_prompt, build_skill_validation_prompt, MATCH_SYSTEM_PROMPT, SKILL_VALIDATION_PROMPT, SKILL_CATALOG, TALENT_ROLES
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LOGGING — mismo formato y estructura que main.py original (Flask)
+# ═══════════════════════════════════════════════════════════════════════════
+
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(message)s'
+    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-DB_PATH = "atenea_central.db"
+# ═══════════════════════════════════════════════════════════════════════════
+# APP FASTAPI
+# ═══════════════════════════════════════════════════════════════════════════
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-if not ANTHROPIC_API_KEY:
-    logger.warning("⚠️ ANTHROPIC_API_KEY no está en variables de entorno. Configúrala antes de producción.")
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-app = Flask(
-    __name__,
-    template_folder=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'templates')
+app = FastAPI(
+    title="Atenea Lab — Chat Multiagente",
+    description="Backend de chat para Atenea Lab Desk. Soporta Claude, Gemini y DeepSeek con autenticación Premium.",
+    version="1.0.0",
 )
 
-# ─ CORS: Permitir consumo desde dashboard local y móvil en desarrollo
-# En producción, especificar origins explícitos
-CORS(app, resources={
-    r"/api/*": {
-        "origins": [
-            "http://localhost:*",
-            "http://127.0.0.1:*",
-            "https://atenea-backend-fggs.onrender.com",
-            "https://atenea-desk.vercel.app",
-            "https://ateneadesk.vercel.app",
-            "capacitor://localhost",
-            "exp://192.168.*:*",
-            "file://"
-        ],
-        "methods": ["GET", "POST", "OPTIONS", "PUT", "DELETE"],
-        "allow_headers": ["Content-Type", "Authorization", "X-Requested-With"]
-    }
-})
+# ── CORS: permitir consumo desde el Desk desplegado en Vercel ──
+ALLOWED_ORIGINS = [
+    "https://app.atenealabmx.com",
+    "http://localhost:5173",  # Para desarrollo local
+    "https://ateneadesk.vercel.app", # Sin guión (despliegue actual)
+    "https://atenea-desk.vercel.app", # Con guión (despliegue alternativo)
+]
 
-# ── Rate Limiting (punto 14): límite por IP para endpoints de IA ──
-# Previene costos descontrolados por abuso o bucles accidentales.
-# Límites conservadores para un sistema de inspección (no chat masivo):
-#   - orquestar-emergencia: 20 requests / minuto / IP  (dictámenes IA)
-#   - endpoints de consulta: 60 requests / minuto / IP
-limiter = Limiter(
-    key_func=get_remote_address,
-    default_limits=["100 per minute"],  # límite global generoso
-    storage_uri="memory://",           # memoria; en prod usar redis://
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# Vincular limiter a la app Flask después de crearla
-limiter.init_app(app)
+# ── Rate Limiter: 20 req/min por IP (mismo patrón que flask-limiter en main.py) ──
+limiter = Limiter(key_func=get_remote_address, default_limits=["20 per minute"])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, lambda request, exc: HTTPException(status_code=429, detail="Demasiadas solicitudes. Espera un momento antes de intentar de nuevo."))
 
-ROLES_VALIDOS = {"SUPERVISOR_GENERAL", "DIRECTOR_OBRA", "AUDITOR_STPS", "OPERADOR"}
-TAMANOS_OBRA_VALIDOS = {"1-15", "16-50", "51+"}
+# ── Moderación backend (doble verificación, frontend + backend) ──
+ABUSIVE_KEYWORDS = [
+    "puta", "puto", "mierda", "pendejo", "cabrón", "chinga", "verga",
+    "idiota", "imbécil", "estúpido", "fuck", "shit", "bitch", "asshole",
+]
+ILLEGAL_KEYWORDS = [
+    "droga", "narcótico", "fraude", "soborno", "evadir", "ilegal",
+    "hack", "pirate", "crack", "keygen", "lavado de dinero",
+]
+JAILBREAK_PATTERNS = [
+    "ignora las instrucciones", "eres un", "actúa como", "eres ahora",
+    "modo desarrollador", "developer mode", "dismiss previous",
+    "olvida todo", "reset prompt",
+]
+MEDICAL_PATTERNS = [
+    "me duele", "sangre", "fractura", "quemadura", "convulsión",
+    "infarto", "paro cardíaco", "accidente grave",
+]
 
-# ── Modelo unificado de estados del pipeline ──
-ESTADOS_PIPELINE = {
-    "PENDIENTE",
-    "PROCESANDO",
-    "DICTAMINADO",
-    "ERROR",
-    "OFFLINE_PENDIENTE_SYNC",
-    "SINCRONIZADO"
+MODERATION_RESPONSES = {
+    "abusive": "No puedo responder a mensajes con lenguaje ofensivo. Si tienes una duda sobre cómo usar Atenea Lab Desk, por favor reformúlala con respeto y con gusto te ayudo.",
+    "illegal": "No puedo ayudar con eso. Atenea Lab es una plataforma de seguridad industrial y cumplimiento normativo. Si necesitas asistencia legal real, contacta a tu supervisor o a la STPS.",
+    "jailbreak": "Soy un asistente de capacitación de Atenea Lab Desk. Solo puedo ayudarte con dudas sobre el uso de la plataforma.",
+    "medical": "No puedo evaluar situaciones reales de seguridad. Si hay un riesgo inminente, sigue tu protocolo de emergencia y contacta a tu supervisor de seguridad.",
 }
 
-# ==========================================
-# RETRY CON BACKOFF (punto 13) — genérico para llamadas IA
-# ==========================================
-# Máximo 2 reintentos con backoff exponencial + jitter.
-# Si después de 3 intentos totales (1 inicial + 2 retry) la IA no responde,
-# se devuelve error claro al usuario.
-MAX_RETRIES = 2
-BASE_DELAY_SECONDS = 2  # Delay base: 2s → 4s → máximo 10s
 
-
-def _retry_con_backoff(func, *args, logger_name="", **kwargs):
+async def call_glm_direct(prompt: str, agent_config: dict) -> str:
     """
-    Ejecuta func(*args, **kwargs) con hasta MAX_RETRIES reintentos.
-    Entre reintentos, espera con backoff exponencial + jitter aleatorio.
-    
-    Retorna (resultado, None) si éxito, (None, mensaje_error) si falló tras reintentos.
+    Llama directamente a la API de Zhipu (BigModel) para GLM 5.2 usando GLM_API_KEY.
+
+    Args:
+        prompt: Texto del usuario (último mensaje).
+        agent_config: Configuración del agente GLM (de AGENT_TYPE_MAPPING).
+
+    Returns:
+        str con el contenido de la respuesta del modelo.
+
+    Raises:
+        RuntimeError: si GLM_API_KEY no está configurada o falla la petición.
     """
-    ultimo_error = None
-    for intento in range(1 + MAX_RETRIES):  # 1 inicial + 2 retry = 3 total
-        try:
-            resultado = func(*args, **kwargs)
-            return resultado, None
-        except Exception as e:
-            ultimo_error = e
-            if intento < MAX_RETRIES:
-                delay = min(BASE_DELAY_SECONDS * (2 ** intento), 10)
-                jitter = random.uniform(0, delay * 0.3)
-                total_delay = delay + jitter
-                logger.warning(
-                    "⚠️  [Retry %d/%d] %s falló: %s. Reintentando en %.1fs...",
-                    intento + 1, MAX_RETRIES, logger_name, str(e)[:100], total_delay,
-                )
-                time.sleep(total_delay)
-            else:
-                logger.error(
-                    "❌ [Retry AGOTADO] %s falló tras %d intentos. Último error: %s",
-                    logger_name, 1 + MAX_RETRIES, str(e)[:200],
-                )
-    return None, str(ultimo_error)
+    import os
+    import time
+    import aiohttp
 
+    api_key = os.environ.get("GLM_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("GLM_API_KEY no configurada en variables de entorno")
 
-# ==========================================
-# LOGS DE AUDITORÍA (punto 15) — tabla separada para acciones de IA
-# ==========================================
-def init_audit_db():
-    """Crea la tabla de auditoría de IA si no existe."""
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS auditoria_ia (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        firebase_uid TEXT DEFAULT '',
-                        accion TEXT NOT NULL,
-                        resultado TEXT NOT NULL,
-                        detalle TEXT DEFAULT '',
-                        timestamp TEXT NOT NULL
-                    )''')
-        conn.commit()
+    glm_provider_cfg = PROVIDER_CONFIG.get("glm", {})
+    base_url_direct = glm_provider_cfg.get(
+        "base_url_direct", "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    )
+    model_name_direct = glm_provider_cfg.get("model_name_direct", "glm-5.2")
+    system_prompt = agent_config.get("prompt", "")
 
+    inicio = time.time()
+    openai_messages = []
+    if system_prompt:
+        openai_messages.append({"role": "system", "content": system_prompt})
+    openai_messages.append({"role": "user", "content": prompt})
 
-def registrar_auditoria(accion: str, resultado: str, detalle: str = "",
-                        firebase_uid: str = ""):
-    """
-    Registra una acción de IA en la tabla de auditoría (punto 15).
-    Campos: firebase_uid, accion (dictamen_generado|alerta_forense|confirmacion_shutdown),
-    resultado (exito|error|pendiente), detalle, timestamp.
-    """
+    payload = {
+        "model": model_name_direct,
+        "messages": openai_messages,
+        "max_tokens": glm_provider_cfg.get("max_tokens", 2048),
+        "temperature": glm_provider_cfg.get("temperature", 0.7),
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute('''INSERT INTO auditoria_ia (firebase_uid, accion, resultado, detalle, timestamp)
-                         VALUES (?, ?, ?, ?, ?)''',
-                      (firebase_uid, accion, resultado, detalle[:500], datetime.now().isoformat()))
-            conn.commit()
-    except Exception as e:
-        logger.warning(f"⚠️  No se pudo registrar auditoría: {e}")
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                base_url_direct, json=payload, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    raise RuntimeError(f"GLM Direct HTTP {resp.status}: {error_text[:200]}")
+                data = await resp.json()
+                duracion = round(time.time() - inicio, 2)
+                contenido = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                uso = data.get("usage", {})
+                logger.info(
+                    "🟢 [GLM-DIRECT] %s | %d in / %d out tokens | %.2fs",
+                    model_name_direct,
+                    uso.get("prompt_tokens", 0),
+                    uso.get("completion_tokens", 0),
+                    duracion,
+                )
+                return contenido
+    except aiohttp.ClientError as e:
+        logger.error("❌ [GLM-DIRECT] Error de conexión: %s", e)
+        raise RuntimeError(f"GLM Direct no disponible: {e}") from e
 
 
-# Inicializar tabla de auditoría al arrancar
-init_audit_db()
+async def call_tokenhub_direct(prompt: str, agent_config: dict) -> str:
+    """
+    Llama directamente a TokenHub (Tencent Cloud MAAS) para Hy3.
+    Chat Completions API estandar. Usa TOKENHUB_API_KEY.
 
-# ==========================================
-# BÓVEDA CENTRAL V4 — incluye estado_pipeline + timestamps de trazabilidad
-# ==========================================
-def init_denuncias_anonimas():
-    """Crea la tabla de denuncias anonimas (NOM-035). Sin ningun id de usuario."""
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS denuncias_anonimas (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        ticket_id TEXT NOT NULL,
-                        categoria TEXT NOT NULL,
-                        descripcion TEXT NOT NULL,
-                        evidencia_url TEXT DEFAULT '',
-                        fecha TEXT NOT NULL,
-                        estado TEXT DEFAULT 'NUEVA'
-                    )''')
-        conn.commit()
-    logger.info(" Tabla denuncias_anonimas lista (sin uid ni ip).")
+    Args:
+        prompt: Texto del usuario (ultimo mensaje).
+        agent_config: Configuración del agente Hunyuan (de AGENT_TYPE_MAPPING / PROVIDER_CONFIG).
 
-    # Tabla de evaluaciones NOM-035 (psicosocial) — sin PII del trabajador
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS evaluaciones_nom035 (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        company_id TEXT NOT NULL,
-                        fecha TEXT NOT NULL,
-                        guia TEXT DEFAULT 'guia_i',
-                        nivel_riesgo TEXT NOT NULL,
-                        violencia_laboral INTEGER DEFAULT 0,
-                        porcentaje_global REAL DEFAULT 0,
-                        requiere_profesional INTEGER DEFAULT 0,
-                        dominios_json TEXT DEFAULT '{}',
-                        alertas_json TEXT DEFAULT '[]'
-                    )''')
-        conn.commit()
-    logger.info(" Tabla evaluaciones_nom035 lista (con company_id, sin PII).")
+    Returns:
+        str con el contenido de la respuesta del modelo.
+
+    Raises:
+        RuntimeError: si TOKENHUB_API_KEY no esta configurada o falla la peticion.
+    """
+    import os
+    import time
+    import aiohttp
+
+    api_key = os.environ.get("TOKENHUB_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("TOKENHUB_API_KEY no configurada en variables de entorno")
+
+    hy3_cfg = PROVIDER_CONFIG.get("hunyuan", {})
+    base_url = hy3_cfg.get("base_url_direct", "https://tokenhub-intl.tencentcloudmaas.com/v1/chat/completions")
+    model_id = hy3_cfg.get("model_direct", "hy3")
+    system_prompt = agent_config.get("prompt", "")
+
+    inicio = time.time()
+    openai_messages = []
+    if system_prompt:
+        openai_messages.append({"role": "system", "content": system_prompt})
+    openai_messages.append({"role": "user", "content": prompt})
+
+    payload = {
+        "model": model_id,
+        "messages": openai_messages,
+        "max_tokens": hy3_cfg.get("max_tokens", 2048),
+        "temperature": hy3_cfg.get("temperature", 0.7),
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                base_url, json=payload, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    raise RuntimeError(f"TokenHub HTTP {resp.status}: {error_text[:200]}")
+                data = await resp.json()
+                duracion = round(time.time() - inicio, 2)
+                contenido = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                uso = data.get("usage", {})
+                logger.info(
+                    "🟣 [TOKENHUB] %s | %d in / %d out tokens | %.2fs",
+                    model_id,
+                    uso.get("prompt_tokens", 0),
+                    uso.get("completion_tokens", 0),
+                    duracion,
+                )
+                return contenido
+    except aiohttp.ClientError as e:
+        logger.error("❌ [TOKENHUB] Error de conexión: %s", e)
+        raise RuntimeError(f"TokenHub no disponible: {e}") from e
 
 
-def init_central_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS dictamenes_stps_v2 (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        fecha TEXT,
-                        contexto TEXT,
-                        tipificacion_legal TEXT,
-                        responsabilidad TEXT,
-                        estado TEXT,
-                        multa_minima INTEGER,
-                        multa_maxima INTEGER,
-                        dictamen_raw TEXT,
-                        firma_digital TEXT,
-                        rol_supervisor TEXT
-                    )''')
+def detectar_categoria_backend(texto: str) -> str | None:
+    """Verifica un mensaje contra las 4 categorías de moderación. Retorna la categoría o None."""
+    t = texto.lower()
+    if any(k in t for k in ABUSIVE_KEYWORDS):
+        return "abusive"
+    if any(k in t for k in ILLEGAL_KEYWORDS):
+        return "illegal"
+    if any(p in t for p in JAILBREAK_PATTERNS):
+        return "jailbreak"
+    if any(p in t for p in MEDICAL_PATTERNS):
+        return "medical"
+    return None
 
-        columnas = [row[1] for row in c.execute("PRAGMA table_info(dictamenes_stps_v2)")]
 
-        migraciones = {
-            "firma_digital": "TEXT DEFAULT ''",
-            "rol_supervisor": "TEXT DEFAULT ''",
-            "estado_pipeline": "TEXT DEFAULT 'PENDIENTE'",
-            "timestamp_recibido": "TEXT DEFAULT ''",
-            "timestamp_procesado": "TEXT DEFAULT ''",
-            "error_detalle": "TEXT DEFAULT ''",
+# ═══════════════════════════════════════════════════════════════════════════
+# ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/health")
+async def health():
+    """
+    Health check del backend de chat.
+
+    Response 200:
+    {
+        "status": "ok",
+        "message": "Atenea Chat Backend en línea ✅",
+        "timestamp": "2026-07-12T19:00:00.123456"
+    }
+    """
+    return {
+        "status": "ok",
+        "message": "Atenea Chat Backend en línea ✅",
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+@app.get("/")
+async def root():
+    return {
+        "message": "¡Bienvenido al Cerebro IA de Atenea Lab! 🧠🇲🇽",
+        "status": "online",
+        "version": "1.0.0",
+        "docs": "/docs"
+    }
+
+
+@app.get("/api/agents")
+async def agents_list_endpoint():
+    """
+    Lista los agentes disponibles con sus etiquetas y descripciones.
+    No requiere autenticación (informativo para el frontend).
+
+    Response 200:
+    {
+        "agents": [
+            {"type": "vision", "label": "👁 Inspector (Foto/Audio)", "description": "..."},
+            {"type": "legal", "label": "⚖ Legal (STPS)", "description": "..."},
+            {"type": "analytics", "label": "📊 Analítico (Datos)", "description": "..."}
+        ],
+        "default": "legal"
+    }
+    """
+    return {
+        "agents": list_agents(),
+        "default": "deepseek",
+    }
+
+
+@app.post("/api/chat")
+@limiter.limit("20/minute")
+async def chat_endpoint(
+    request: Request,
+    user: dict = Depends(verificar_acceso_premium),
+):
+    """
+    Endpoint principal de chat multiagente — requiere autenticación Premium.
+
+    Headers requeridos:
+        Authorization: Bearer <firebase_id_token>
+
+    Request JSON:
+    {
+        "model": "claude" | "gemini" | "deepseek",
+        "messages": [
+            {"role": "user" | "assistant", "content": "..."}
+        ],
+        "context": {                          // opcional
+            "userId": "string",
+            "role": "string"
         }
-        for columna, tipo in migraciones.items():
-            if columna not in columnas:
-                c.execute(f"ALTER TABLE dictamenes_stps_v2 ADD COLUMN {columna} {tipo}")
-                logger.info(f"🔧 [Migración] Columna '{columna}' añadida.")
-
-        conn.commit()
-    logger.info("✅ Base de datos central lista (v4 con estado_pipeline).")
-
-
-def limpiar_datos_migrados_heredados():
-    """
-    Normaliza los registros migrados de la fase anterior que quedaron con
-    placeholders 'ND' y 'FECHA_NO_DISPONIBLE_MIGRACION'. No los borra —
-    los marca con estado_pipeline='DICTAMINADO' (ya tienen su JSON, solo
-    les faltaba el campo nuevo) y limpia la fecha ilegible.
-    """
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute('''
-            UPDATE dictamenes_stps_v2
-            SET estado_pipeline = 'DICTAMINADO',
-                fecha = CASE WHEN fecha = 'FECHA_NO_DISPONIBLE_MIGRACION'
-                             THEN 'Migrado (fecha no disponible)'
-                             ELSE fecha END
-            WHERE estado_pipeline = '' OR estado_pipeline IS NULL
-        ''')
-        afectados = c.rowcount
-        conn.commit()
-    if afectados:
-        logger.info(f"🧹 [Limpieza] {afectados} registro(s) heredado(s) normalizados a estado_pipeline='DICTAMINADO'.")
-
-
-init_denuncias_anonimas()
-init_central_db()
-limpiar_datos_migrados_heredados()
-
-# ==========================================
-# PROMPT MAESTRO — Abogado STPS
-# ==========================================
-PROMPT_SYSTEM_ABOGADO = """Eres el Abogado en Jefe y Especialista en Riesgos de la STPS de México para Atenea Lab. Tu idioma estricto es ESPAÑOL DE MÉXICO.
-REGLAS ABSOLUTAS:
-- SOLO JSON puro como salida. SIN texto adicional. SIN markdown. SIN ```json
-- Todos los montos en Pesos Mexicanos (MXN).
-- El JSON debe tener EXACTAMENTE esta estructura:
-{
-  "tipificacion_legal": "NOM-XXX-STPS / Infracción detectada...",
-  "responsabilidad_patronal": "DIRECTA / INDIRECTA",
-  "sancion_stps": {
-    "multa_minima_estimada": 0,
-    "multa_maxima_estimada": 0,
-    "justificacion_legal": "Según el artículo..."
-  },
-  "plan_blindaje_legal": [
-    {"prioridad": 1, "accion_defensa": "..."}
-  ],
-  "conclusiones": {
-    "cumplimiento_pct": 0,
-    "estado": "CRITICO o ALTO o MEDIO o BAJO"
-  }
-}"""
-
-
-def generar_firma_criptografica(firma_raw, rol, payload_dict):
-    cadena_a_firmar = f"{firma_raw}|{rol}|{json.dumps(payload_dict, sort_keys=True)}"
-    return hashlib.sha256(cadena_a_firmar.encode()).hexdigest()
-
-
-def validar_payload(data):
-    """
-    Devuelve (es_valido, respuesta_error_o_none). Centraliza la validación
-    para que tanto el modo síncrono como el background la reutilicen igual.
-    
-    CAMPOS REQUERIDOS PARA POST /api/v1/orquestar-emergencia:
-    - evidencia (str, base64): Imagen en formato base64 (JPEG/PNG)
-    - contexto (str): Descripción del evento/inspección
-    - fecha (str, ISO8601): Fecha del evento (ej: 2025-06-20T10:30:00)
-    - firma_digital (str): Identificador del operador/supervisor
-    - rol_supervisor (str): Rol del operador (SUPERVISOR_GENERAL, DIRECTOR_OBRA, AUDITOR_STPS, OPERADOR)
-    
-    CAMPOS OPCIONALES:
-    - modo (str): "rapido" (retorna 202 + background) o "detallado" (default, síncrono)
-    - tamano_obra (str): "1-15", "16-50" o "51+" (default "1-15"). Afecta el tramo
-      usado por el calculador determinístico de multas UMA en abogado_stps.py.
-    """
-    if data is None:
-        return False, (jsonify({"error": "FORMATO_INVALIDO", "detalle": "Body vacío o no es JSON."}), 422)
-
-    campos_faltantes = [
-        campo for campo in ("evidencia", "contexto", "fecha", "firma_digital", "rol_supervisor")
-        if campo not in data
-    ]
-    if campos_faltantes:
-        return False, (jsonify({
-            "error": "CAMPOS_FALTANTES",
-            "detalle": f"Faltan campos obligatorios: {', '.join(campos_faltantes)}",
-            "campos_requeridos": ["evidencia", "contexto", "fecha", "firma_digital", "rol_supervisor"]
-        }), 422)
-
-    rol_supervisor = data.get("rol_supervisor", "OPERADOR")
-    if rol_supervisor not in ROLES_VALIDOS:
-        return False, (jsonify({
-            "error": "ROL_INVALIDO",
-            "detalle": f"'{rol_supervisor}' no es un rol reconocido.",
-            "roles_validos": list(ROLES_VALIDOS)
-        }), 422)
-
-    tamano_obra = data.get("tamano_obra")
-    if tamano_obra is not None and tamano_obra not in TAMANOS_OBRA_VALIDOS:
-        return False, (jsonify({
-            "error": "TAMANO_OBRA_INVALIDO",
-            "detalle": f"'{tamano_obra}' no es un tamaño de obra reconocido.",
-            "tamanos_validos": list(TAMANOS_OBRA_VALIDOS)
-        }), 422)
-
-    return True, None
-
-
-def _extraer_nombre_obra(contexto: str) -> str:
-    """Intenta extraer el nombre de la obra/instalación del contexto."""
-    # Buscar patrones como "Obra: X", "Instalación: X", "Edificio X"
-    patrones = [
-        r'(?:Obra|Instalación|Edificio|Planta|Nave)\s*[:]\s*([^,.]+)',
-        r'(?:Obra|Instalación|Edificio|Planta|Nave)\s+([^,.]+(?:[ ]?\d+)?)',
-    ]
-    for patron in patrones:
-        match = re.search(patron, contexto, re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
-    return "Instalación no especificada"
-
-
-def _extraer_sector(contexto: str) -> str:
-    """Intenta inferir el sector industrial del contexto."""
-    sectores = {
-        "construcción": "Construcción",
-        "manufactura": "Manufactura",
-        "industrial": "Manufactura",
-        "almacén": "Almacenamiento",
-        "oficina": "Oficinas",
-        "miner": "Minería",
-        "petrol": "Petróleo y Gas",
-        "eléctric": "Energía Eléctrica",
     }
-    contexto_lower = contexto.lower()
-    for clave, sector in sectores.items():
-        if clave in contexto_lower:
-            return sector
-    return "General"
 
-
-def _adaptar_dictamen_abogado(dictamen_abogado: dict, firma_raw: str,
-                               rol_supervisor: str, firma_criptografica: str,
-                               fecha_reporte: str, reporte_forense_haiku: str = "") -> dict:
-    """
-    Adapta la salida de abogado_stps.generar_dictamen_legal() al formato
-    que espera la tabla dictamenes_stps_v2.
-    
-    Mapeo de campos:
-      abogado_stps          → tabla dictamenes_stps_v2
-      ─────────────────────────────────────────────────
-      tipificacion_legal     → tipificacion_legal
-      severidad              → estado (mapeado: CRÍTICA→CRITICO, MEDIA→MEDIO, etc.)
-      multa_estimada         → multa_minima / multa_maxima (extracción numérica)
-      resumen_legal          → se incluye en dictamen_raw
-      capacitacion_recomendada → se incluye en dictamen_raw
-      tipo_instalacion       → se incluye en dictamen_raw
-    """
-    severidad = dictamen_abogado.get("severidad", "DESCONOCIDA")
-    estado_mapeado = {
-        "CRÍTICA": "CRITICO",
-        "MEDIA": "MEDIO",
-        "LLAMADA DE ATENCIÓN": "BAJO",
-        "STRIKE": "BAJO",
-        "DESCONOCIDA": "ND",
-    }.get(severidad, "ND")
-
-    # Extraer monto numérico de multa_estimada (ej: "$250,000 MXN" → 250000)
-    multa_str = dictamen_abogado.get("multa_estimada", "$0 MXN")
-    numeros = re.findall(r'[\d,]+', str(multa_str))
-    multa_valor = 0
-    if numeros:
-        multa_valor = int(numeros[0].replace(",", ""))
-
-    # Inferir responsabilidad patronal de la severidad
-    responsabilidad = {
-        "CRÍTICA": "DIRECTA",
-        "MEDIA": "DIRECTA",
-        "LLAMADA DE ATENCIÓN": "INDIRECTA",
-        "STRIKE": "INDIRECTA",
-    }.get(severidad, "ND")
-
-    # Construir dictamen completo para almacenar en dictamen_raw
-    dictamen_completo = {
-        **dictamen_abogado,
-        "auditoria_autorizacion": {
-            "firmante_id": firma_raw,
-            "rol_autorizado": rol_supervisor,
-            "hash_legal": firma_criptografica,
-            "fecha_reporte": fecha_reporte,
-        },
-        "reporte_forense_haiku": reporte_forense_haiku,
-        "modelo_guardrail": "claude-haiku-4-5-20251001",
-        "modelo_dictamen": "claude-sonnet-5",
+    Response 200:
+    {
+        "content": "Respuesta del modelo...",
+        "model": "claude-sonnet-4-6",
+        "tokens_entrada": 42,
+        "tokens_salida": 150,
+        "costo_usd": 0.002376,
+        "tiempo_s": 1.23
     }
+
+    Response 401: Token inválido o faltante
+    Response 403: Usuario sin plan Premium
+    Response 422: Body inválido o modelo no soportado
+    Response 500: Error del proveedor de IA
+    """
+    t_inicio = time.time()
+    uid = user.get("uid", "desconocido")
+    email = user.get("email", "desconocido")
+
+    # Parsear body
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Body inválido. Se requiere JSON válido.")
+
+    agent_type = body.get("agent_type", "deepseek").strip()  # Default: DeepSeek (más barato)
+    model = body.get("model", "").strip()
+    messages = body.get("messages", [])
+    context = body.get("context", {})
+
+    # Determinar configuración del agente según agent_type
+    agent_config = get_agent_config(agent_type if agent_type else "deepseek")
+
+    # ── Middleware de Créditos Atenea ──
+    company_id = context.get("companyId") or user.get("company_id", "")
+    credits_balance = context.get("creditsBalance", 999)  # TODO: leer de Firestore en producción
+    is_valid, credit_msg = validate_credits(agent_type, credits_balance)
+    if not is_valid:
+        raise HTTPException(status_code=402, detail=credit_msg)
+
+    # Si no se especifica model explícito, usar el del agente
+    if not model:
+        model = agent_config["model"]
+
+    # Validar modelo resultante
+    VALID_MODELS = ("claude", "gemini", "deepseek", "glm", "flash", "hunyuan", "kimi", "minimax", "glm52")
+    if model not in VALID_MODELS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Modelo '{model}' no válido. Opciones: {', '.join(VALID_MODELS)}. Usa agent_type en vez de model.",
+        )
+
+    if not messages or not isinstance(messages, list):
+        raise HTTPException(
+            status_code=422,
+            detail="Campo 'messages' requerido. Debe ser una lista de mensajes.",
+        )
+
+    # Validar formato de messages
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict) or "role" not in msg or "content" not in msg:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Mensaje {i} inválido. Cada mensaje requiere 'role' y 'content'.",
+            )
+        if msg["role"] not in ("user", "assistant"):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Mensaje {i}: role '{msg['role']}' inválido. Usa 'user' o 'assistant'.",
+            )
+
+    # ══════════════════════════════════════════════════════════════
+    # DOBLE VERIFICACIÓN DE MODERACIÓN (backend, después del frontend)
+    # ══════════════════════════════════════════════════════════════
+    for i, msg in enumerate(messages):
+        if msg.get("role") == "user":
+            cat = detectar_categoria_backend(msg.get("content", ""))
+            if cat:
+                logger.warning(
+                    "🛡️ [MODERACIÓN] user=%s categoria=%s msg_preview=%.80s",
+                    uid, cat, msg["content"][:80],
+                )
+                return {
+                    "content": MODERATION_RESPONSES[cat],
+                    "model": "moderation_block",
+                    "tokens_entrada": 0,
+                    "tokens_salida": 0,
+                    "costo_usd": 0.0,
+                    "tiempo_s": 0.0,
+                    "moderado": True,
+                    "categoria": cat,
+                }
+
+    # System prompt: usa el prompt del agente seleccionado
+    system_prompt = agent_config["prompt"]
+
+    # Si el agente es legal, inyectar contexto de NOMs mexicanas
+    if agent_type == "legal":
+        try:
+            import json, os
+            noms_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "noms_mexico.json")
+            if os.path.exists(noms_path):
+                with open(noms_path, "r", encoding="utf-8") as f:
+                    noms_data = json.load(f)
+                noms_context = "BASE DE CONOCIMIENTO DE NOMs MEXICANAS:\n\n"
+                for nom in noms_data:
+                    noms_context += (
+                        f"📋 {nom['id']} — {nom['nombre']}\n"
+                        f"   Aplicación: {nom.get('aplicacion', 'General')}\n"
+                        f"   Puntos críticos: {nom.get('puntos_criticos_resumen', 'No disponible')}\n\n"
+                    )
+                system_prompt = f"{noms_context}\n\n{system_prompt}"
+        except Exception as e:
+            logger.warning("⚠️ No se pudo cargar NOMs context: %s", e)
+
+    # Log de auditoría (mismo formato que bitacora_atenea.log del backend Flask)
+    logger.info(
+        "📥 [CHAT] user=%s email=%s agent=%s model=%s msgs=%d",
+        uid, email, agent_type, model, len(messages),
+    )
+
+    # Invocar al proveedor de IA
+    try:
+        # Enrutamiento directo a Zhipu AI (GLM-4, GLM-4-Flash, Kimi, Minimax, GLM 5.2)
+        if agent_type in ("glm", "flash", "kimi", "minimax", "glm52"):
+            zhipu_cfg = PROVIDER_CONFIG.get(agent_type, {})
+            zhipu_model = zhipu_cfg.get("model_name", "glm-4")
+            resultado = await call_zhipu_direct(
+                model=zhipu_model,
+                messages=messages,
+                system_prompt=system_prompt,
+            )
+            duracion_total = round(time.time() - t_inicio, 2)
+            return {
+                "content": resultado["content"],
+                "model": zhipu_model,
+                "tokens_entrada": resultado["tokens_entrada"],
+                "tokens_salida": resultado["tokens_salida"],
+                "costo_usd": 0.0,
+                "tiempo_s": duracion_total,
+            }
+
+        # Enrutamiento directo a TokenHub (Hy3) — unica ruta valida
+        if agent_type == "hunyuan":
+            hy3_cfg = PROVIDER_CONFIG.get("hunyuan", {})
+            prompt = ""
+            for m in reversed(messages):
+                if m["role"] == "user":
+                    prompt = m["content"]
+                    break
+            contenido = await call_tokenhub_direct(prompt=prompt, agent_config=agent_config)
+            duracion_total = round(time.time() - t_inicio, 2)
+            return {
+                "content": contenido,
+                "model": hy3_cfg.get("model_direct", "hy3"),
+                "tokens_entrada": 0,
+                "tokens_salida": 0,
+                "costo_usd": 0.0,
+                "tiempo_s": duracion_total,
+            }
+
+        # Cualquier otro caso (deepseek, claude, gemini)
+        resultado = await generar_respuesta_chat(
+            model=model,
+            messages=messages,
+            system_prompt=system_prompt,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    duracion_total = round(time.time() - t_inicio, 2)
+
+    # Log de auditoría (respuesta exitosa)
+    logger.info(
+        "📤 [CHAT] user=%s model=%s tokens_in=%d tokens_out=%d costo=$%.6f tiempo=%.2fs",
+        uid,
+        resultado["model"],
+        resultado["tokens_entrada"],
+        resultado["tokens_salida"],
+        resultado["costo_usd"],
+        duracion_total,
+    )
 
     return {
-        "tipificacion_legal": dictamen_abogado.get("tipificacion_legal", "No especificada"),
-        "responsabilidad_patronal": responsabilidad,
-        "conclusiones": {
-            "estado": estado_mapeado,
-            "severidad_original": severidad,
-            "cumplimiento_pct": 0,
-        },
-        "sancion_stps": {
-            "multa_minima_estimada": multa_valor,
-            "multa_maxima_estimada": multa_valor,
-            "justificacion_legal": dictamen_abogado.get("resumen_legal", ""),
-        },
-        "plan_blindaje_legal": [
-            {"prioridad": 1, "accion_defensa": dictamen_abogado.get("capacitacion_recomendada", "") or "Sin recomendación"}
-        ],
-        "dictamen_raw_full": dictamen_completo,
+        "content": resultado["content"],
+        "model": resultado["model"],
+        "tokens_entrada": resultado["tokens_entrada"],
+        "tokens_salida": resultado["tokens_salida"],
+        "costo_usd": resultado["costo_usd"],
+        "tiempo_s": duracion_total,
     }
 
 
-def llamar_a_claude_y_guardar(dictamen_id, data, firma_criptografica):
+# ═══════════════════════════════════════════════════════════════════════════
+# ENDPOINT: Inspección Visual (Gemini Vision)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/vision/inspect")
+async def vision_inspect_endpoint(
+    image: UploadFile = File(...),
+    context: str = Form(""),
+):
     """
-    Pipeline de dos pasos Atenea Lab Fase 1:
-      1. Haiku (guardrail rápido): analiza la imagen → descripción textual forense
-      2. Sonnet 5 (abogado_stps): recibe el texto → dictamen legal estructurado
-    
-    Actualiza el registro ya existente (insertado previamente como PENDIENTE).
-    Esta función corre tanto en el hilo de background (modo rápido) como inline
-    en el modo síncrono.
-    """
-    inicio = time.time()
-    contexto_reportado = data.get("contexto", "Inspección de rutina")
-    firma_raw = data.get("firma_digital", "OPERADOR_DESCONOCIDO")
-    rol_supervisor = data.get("rol_supervisor", "OPERADOR")
-    evidencia_b64 = data.get("evidencia", "")
-    nombre_obra = _extraer_nombre_obra(contexto_reportado)
-    sector = _extraer_sector(contexto_reportado)
+    Endpoint de inspección visual con IA.
+    Recibe una imagen y un contexto opcional, la analiza con Gemini Vision
+    y retorna hallazgos de seguridad estructurados.
 
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute(
-            "UPDATE dictamenes_stps_v2 SET estado_pipeline = 'PROCESANDO' WHERE id = ?",
-            (dictamen_id,)
-        )
-        conn.commit()
-
-    logger.info(f"⚙️  [Pipeline #{dictamen_id}] PROCESANDO — Paso 1/2: Haiku analizando imagen...")
-
-    # ── PASO 1: Haiku — guardrail rápido sobre la imagen ──
-    reporte_forense_haiku = ""
-    try:
-        respuesta_haiku = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=500,
-            temperature=0.1,
-            system="Eres un inspector de seguridad industrial. Describe en español de México, de forma concisa y forense, lo que observas en la imagen: condiciones inseguras, EPP faltante (casco, arnés, chaleco, botas, guantes), zonas de riesgo, maquinaria, trabajadores expuestos. Solo describe hechos observables. No emitas juicios legales.",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": evidencia_b64
-                            }
-                        },
-                        {"type": "text", "text": f"Contexto adicional proporcionado por el operador: {contexto_reportado}"}
-                    ]
-                }
-            ]
-        )
-        reporte_forense_haiku = respuesta_haiku.content[0].text
-        logger.info(f"🔍 [Pipeline #{dictamen_id}] Haiku completó análisis forense ({len(reporte_forense_haiku)} chars).")
-    except Exception as e:
-        logger.warning(f"⚠️  [Pipeline #{dictamen_id}] Haiku falló: {e}. Usando solo contexto como reporte.")
-        reporte_forense_haiku = f"[Análisis de imagen no disponible: {str(e)}] Contexto: {contexto_reportado}"
-
-    # ── PASO 2: Sonnet 5 vía abogado_stps.py — dictamen legal ──
-    logger.info(f"⚖️  [Pipeline #{dictamen_id}] Paso 2/2: Sonnet 5 generando dictamen legal...")
-
-    metadatos_json = {
-        "firma": firma_raw,
-        "rol": rol_supervisor,
-        "timestamp": data.get("fecha", datetime.now().isoformat()),
-        "dictamen_id": dictamen_id,
-    }
-
-    try:
-        dictamen_abogado = generar_dictamen_legal(
-            reporte_forense=reporte_forense_haiku,
-            metadatos_json=metadatos_json,
-            nombre_obra=nombre_obra,
-            sector=sector,
-            imagen_base64=evidencia_b64,  # ← Pasar imagen original a Sonnet 5
-            media_type="image/jpeg",
-            tamano_obra=data.get("tamano_obra", "1-15"),
-        )
-
-        # Adaptar al formato que espera la BD
-        dictamen_real = _adaptar_dictamen_abogado(
-            dictamen_abogado, firma_raw, rol_supervisor,
-            firma_criptografica, data.get("fecha", ""),
-            reporte_forense_haiku
-        )
-
-        duracion = round(time.time() - inicio, 2)
-
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute('''UPDATE dictamenes_stps_v2 SET
-                            tipificacion_legal = ?,
-                            responsabilidad = ?,
-                            estado = ?,
-                            multa_minima = ?,
-                            multa_maxima = ?,
-                            dictamen_raw = ?,
-                            estado_pipeline = 'DICTAMINADO',
-                            timestamp_procesado = ?
-                         WHERE id = ?''',
-                      (dictamen_real.get('tipificacion_legal', 'No especificada'),
-                       dictamen_real.get('responsabilidad_patronal', 'ND'),
-                       dictamen_real.get('conclusiones', {}).get('estado', 'ND'),
-                       dictamen_real.get('sancion_stps', {}).get('multa_minima_estimada', 0),
-                       dictamen_real.get('sancion_stps', {}).get('multa_maxima_estimada', 0),
-                       json.dumps(dictamen_real.get('dictamen_raw_full', dictamen_real), ensure_ascii=False),
-                       datetime.now().isoformat(),
-                       dictamen_id))
-            conn.commit()
-
-        logger.info(f"✅ [Pipeline #{dictamen_id}] DICTAMINADO en {duracion}s (Haiku+Sonnet5) — hash {firma_criptografica[:16]}...")
-        return dictamen_real
-
-    except json.JSONDecodeError as e:
-        logger.error(f"❌ [Pipeline #{dictamen_id}] Sonnet 5 no devolvió JSON válido: {e}")
-        _marcar_error(dictamen_id, f"JSON inválido de Sonnet 5: {e}")
-        return None
-
-    except Exception as e:
-        logger.error(f"❌ [Pipeline #{dictamen_id}] Error en llamada a Sonnet 5: {e}")
-        _marcar_error(dictamen_id, f"Error Sonnet 5: {str(e)}")
-        return None
-
-
-def _marcar_error(dictamen_id, detalle):
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute('''UPDATE dictamenes_stps_v2 SET
-                        estado_pipeline = 'ERROR',
-                        error_detalle = ?,
-                        timestamp_procesado = ?
-                     WHERE id = ?''',
-                  (detalle, datetime.now().isoformat(), dictamen_id))
-        conn.commit()
-
-
-def insertar_registro_pendiente(data, firma_criptografica):
-    """Inserta la fila base en estado PENDIENTE. Se usa en ambos modos
-    antes de invocar a Claude, así el historial siempre tiene rastro
-    inmediato de que la captura llegó, incluso si Claude tarda o falla."""
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute('''INSERT INTO dictamenes_stps_v2
-                     (fecha, contexto, tipificacion_legal, responsabilidad, estado,
-                      multa_minima, multa_maxima, dictamen_raw, firma_digital, rol_supervisor,
-                      estado_pipeline, timestamp_recibido)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                  (data.get("fecha", datetime.now().isoformat()),
-                   data.get("contexto", "Inspección de rutina"),
-                   "Pendiente de análisis",
-                   "ND",
-                   "ND",
-                   0,
-                   0,
-                   "{}",
-                   data.get("firma_digital", "OPERADOR_DESCONOCIDO"),
-                   data.get("rol_supervisor", "OPERADOR"),
-                   "PENDIENTE",
-                   datetime.now().isoformat()))
-        conn.commit()
-        return c.lastrowid
-
-
-# ==========================================
-# ENDPOINTS
-# ==========================================
-
-@app.route('/api/v1/health', methods=['GET'])
-@limiter.limit("60 per minute")
-def health():
-    """
-    Endpoint de salud con verificación de dependencias (Idea #54).
-    Retorna 200 si todas las dependencias responden, 503 si alguna falla.
-    
-    Dependencias verificadas:
-    - SQLite (SELECT 1)
-    - Gemini API key (configuración, sin llamada HTTP)
-    - Claude API key (configuración, sin llamada HTTP)
-    - Disco (escritura temporal)
+    Request: multipart/form-data
+        - image: archivo de imagen (JPEG/PNG)
+        - context: string opcional (ej: "Verificar uso de EPP en andamio")
 
     Response 200:
     {
-        "status": "healthy",
-        "timestamp": "ISO8601",
-        "checks": { ... },
-        "version": "1.0.0"
+        "hallazgos": "texto estructurado con hallazgos",
+        "nivel_riesgo": "Alto" | "Medio" | "Bajo",
+        "nom_aplicable": "NOM-017-STPS-2008, NOM-009-STPS-2011",
+        "accion_recomendada": "texto con acción correctiva"
     }
 
-    Response 503:
-    {
-        "status": "degraded",
-        "timestamp": "ISO8601",
-        "checks": { ... },
-        "version": "1.0.0"
-    }
+    Response 400: Error del proveedor o imagen no válida
     """
-    # ── SQLite ──
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("SELECT 1")
-        sqlite_status = "ok"
-    except Exception as e:
-        sqlite_status = f"error: {e}"
+    import base64
 
-    # ── Gemini API key ──
-    gemini_key = os.environ.get("GOOGLE_API_KEY", "")
-    if not gemini_key:
-        gemini_status = "error: variable GOOGLE_API_KEY no configurada"
-    else:
-        try:
-            # Solo verificar que el cliente se instancia (sin llamada HTTP)
-            from forense_cctv import _get_cliente_cctv
-            cliente = _get_cliente_cctv()
-            gemini_status = "ok"
-        except Exception as e:
-            gemini_status = f"error: {e}"
+    t_inicio = time.time()
 
-    # ── Claude API key ──
-    claude_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not claude_key:
-        claude_status = "error: variable ANTHROPIC_API_KEY no configurada"
-    else:
-        claude_status = "ok"
+    # Validar tipo de imagen
+    contenido = await image.read()
+    if not contenido:
+        raise HTTPException(status_code=400, detail="Imagen vacía o no proporcionada.")
 
-    # ── Disco (escritura temporal) ──
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", delete=True) as f:
-            f.write("health_check")
-            f.flush()
-        disco_status = "ok"
-    except Exception as e:
-        disco_status = f"error: {e}"
+    content_type = image.content_type or "image/jpeg"
+    if not content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail=f"Tipo de archivo no soportado: {content_type}. Usa JPEG o PNG.")
 
-    checks = {
-        "sqlite": sqlite_status,
-        "gemini_api_key": gemini_status,
-        "claude_api_key": claude_status,
-        "disco": disco_status,
-    }
+    # Convertir a Base64
+    img_b64 = base64.b64encode(contenido).decode("utf-8")
+    data_uri = f"data:{content_type};base64,{img_b64}"
 
-    # #75: Estado de cuota Gemini (no bloqueante — el health-check no falla por cuota)
-    try:
-        from forense_cctv import estado_cuota as _estado_cuota
-        gemini_quota = _estado_cuota()
-    except Exception:
-        gemini_quota = {"estado": "error", "detalle": "No disponible"}
+    # Obtener configuración del agente visión
+    agent_config = get_agent_config("vision")
+    system_prompt = agent_config["prompt"]
 
-    todos_ok = all(v == "ok" for v in checks.values())
-    http_code = 200 if todos_ok else 503
-    status_label = "healthy" if todos_ok else "degraded"
+    # Construir prompt con contexto
+    user_prompt = "Analiza esta imagen de seguridad industrial."
+    if context:
+        user_prompt = f"Contexto del inspector: {context}\n\nAnaliza esta imagen de seguridad industrial e identifica riesgos, EPP faltante, o condiciones inseguras."
 
-    logger.info(
-        "🔍 Health-check executed: %s (sqlite=%s gemini=%s claude=%s disco=%s)",
-        status_label, sqlite_status, gemini_status, claude_status, disco_status,
-    )
-
-    return jsonify({
-        "status": status_label,
-        "timestamp": datetime.now().isoformat(),
-        "checks": checks,
-        "gemini_quota": gemini_quota,
-        "version": "1.0.0",
-    }), http_code
-
-
-@app.route('/api/v1/test-conexion', methods=['GET'])
-@limiter.limit("60 per minute")
-def test_conexion():
-    """Legacy endpoint, kept for backward compatibility"""
-    return jsonify({"status": "ok", "message": "Cerebro Atenea en línea ✅"}), 200
-
-
-@app.route('/api/v1/orquestar-emergencia', methods=['POST'])
-@limiter.limit("20 per minute")  # punto 14: rate limiting en endpoint de IA
-def orquestar():
-    """
-    Endpoint principal para procesar emergencias/inspecciones con análisis IA.
-    
-    ▸ MODO "detallado" (default): Retorna 200 con dictamen completo (síncrono).
-    ▸ MODO "rapido": Retorna 202 Accepted, procesa en background, usar polling con GET /api/v1/dictamen/<id>
-    
-    Request JSON (campos REQUERIDOS):
-    {
-        "evidencia": "<base64 image>",
-        "contexto": "Descripción del evento",
-        "fecha": "2025-06-20T10:30:00",
-        "firma_digital": "operador_id",
-        "rol_supervisor": "OPERADOR",
-        "modo": "detallado",  # opcional: "rapido" o "detallado"
-        "tamano_obra": "1-15"  # opcional: "1-15", "16-50" o "51+" (default "1-15")
-    }
-    
-    Response 200 (modo detallado):
-    {
-        "status": "IA_ACTIVADA",
-        "dictamen_id": 42,
-        "dictamen": { ... dictamen JSON completo ... },
-        "firma_criptografica": "hash_sha256"
-    }
-    
-    Response 202 (modo rapido):
-    {
-        "status": "ACEPTADO",
-        "dictamen_id": 42,
-        "estado_pipeline": "PROCESANDO",
-        "firma_criptografica": "hash_sha256",
-        "mensaje": "Evidencia recibida. El dictamen se está generando..."
-    }
-    
-    Response 422 (validación):
-    {
-        "error": "CAMPOS_FALTANTES",
-        "detalle": "Faltan campos obligatorios: evidencia, fecha",
-        "campos_requeridos": ["evidencia", "contexto", "fecha", "firma_digital", "rol_supervisor"]
-    }
-    """
-    t_inicio_request = time.time()
-
-    try:
-        data = request.get_json(force=True)
-    except Exception as e:
-        return jsonify({"error": "JSON_CORRUPTO", "detalle": str(e)}), 422
-
-    es_valido, error_response = validar_payload(data)
-    if not es_valido:
-        return error_response
-
-    rol_supervisor = data.get("rol_supervisor", "OPERADOR")
-    firma_raw = data.get("firma_digital", "OPERADOR_DESCONOCIDO")
-    firma_criptografica = generar_firma_criptografica(firma_raw, rol_supervisor, data)
-
-    logger.info(f"📥 [Request] POST /orquestar-emergencia recibido — firma={firma_raw} rol={rol_supervisor}")
-
-    # ── Modo de operación: "rapido" = 202 + background | "detallado"/ausente = síncrono ──
-    modo = data.get("modo", "detallado")
-
-    dictamen_id = insertar_registro_pendiente(data, firma_criptografica)
-    logger.info(f"💾 [Pipeline #{dictamen_id}] PENDIENTE insertado (modo={modo}).")
-
-    # ── Auditoría: registrar solicitud de dictamen ──
-    firebase_uid = data.get("firebase_uid", firma_raw)
-    registrar_auditoria(
-        accion="dictamen_generado",
-        resultado="pendiente",
-        detalle=f"Dictamen #{dictamen_id} iniciado modo={modo} obra={_extraer_nombre_obra(data.get('contexto',''))}",
-        firebase_uid=firebase_uid,
-    )
-
-    if modo == "rapido":
-        hilo = threading.Thread(
-            target=llamar_a_claude_y_guardar,
-            args=(dictamen_id, data, firma_criptografica),
-            daemon=True
-        )
-        hilo.start()
-
-        duracion_respuesta = round(time.time() - t_inicio_request, 3)
-        logger.info(f"📤 [Pipeline #{dictamen_id}] Respondiendo 202 en {duracion_respuesta}s — procesamiento continúa en background.")
-
-        return jsonify({
-            "status": "ACEPTADO",
-            "dictamen_id": dictamen_id,
-            "estado_pipeline": "PROCESANDO",
-            "firma_criptografica": firma_criptografica,
-            "mensaje": "Evidencia recibida. El dictamen se está generando, consulta el historial en unos segundos."
-        }), 202
-
-    else:
-        dictamen_real = llamar_a_claude_y_guardar(dictamen_id, data, firma_criptografica)
-
-        duracion_respuesta = round(time.time() - t_inicio_request, 2)
-
-        if dictamen_real is None:
-            registrar_auditoria(
-                accion="dictamen_generado",
-                resultado="error",
-                detalle=f"Dictamen #{dictamen_id} falló tras {duracion_respuesta}s",
-                firebase_uid=firebase_uid,
-            )
-            logger.error(f"📤 [Pipeline #{dictamen_id}] Respondiendo 500 tras {duracion_respuesta}s — falló el dictamen.")
-            return jsonify({
-                "error": "Fallo IA",
-                "dictamen_id": dictamen_id,
-                "detalle": "No se pudo procesar, intenta de nuevo."
-            }), 500
-
-        registrar_auditoria(
-            accion="dictamen_generado",
-            resultado="exito",
-            detalle=f"Dictamen #{dictamen_id} completado en {duracion_respuesta}s — severidad={dictamen_real.get('conclusiones',{}).get('severidad_original','N/D')}",
-            firebase_uid=firebase_uid,
-        )
-        logger.info(f"📤 [Pipeline #{dictamen_id}] Respondiendo 200 (síncrono) en {duracion_respuesta}s.")
-        return jsonify({
-            "status": "IA_ACTIVADA",
-            "dictamen_id": dictamen_id,
-            "dictamen": dictamen_real,
-            "firma_criptografica": firma_criptografica
-        }), 200
-
-
-@app.route('/dashboard')
-@limiter.limit("30 per minute")
-def render_dashboard():
-    return render_template('dashboard.html')
-
-
-@app.route('/api/v1/denuncias-anonimas', methods=['POST'])
-@limiter.limit("10 per minute")
-def recibir_denuncia_anonima():
-    """
-    Recibe una denuncia anonima (NOM-035).
-    NO lee el header Authorization (anonimato).
-    Payload: {"categoria": str, "descripcion": str, "evidencia_url": str (opcional)}
-    """
-    try:
-        data = request.get_json(force=True)
-    except Exception:
-        return jsonify({"error": "JSON_INVALIDO"}), 422
-
-    categoria = data.get("categoria", "").strip()
-    descripcion = data.get("descripcion", "").strip()
-    evidencia_url = data.get("evidencia_url", "").strip()
-
-    if not categoria or not descripcion:
-        return jsonify({"error": "CAMPOS_REQUERIDOS", "detalle": "categoria y descripcion son obligatorios"}), 422
-
-    ticket_id = secrets.token_hex(4).upper()
-    ahora = datetime.now().isoformat()
-
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO denuncias_anonimas (ticket_id, categoria, descripcion, evidencia_url, fecha, estado) "
-            "VALUES (?, ?, ?, ?, ?, 'NUEVA')",
-            (ticket_id, categoria, descripcion, evidencia_url, ahora),
-        )
-        conn.commit()
-        fila_id = c.lastrowid
-
-    logger.info(f" Denuncia anonima recibida: ticket={ticket_id} cat={categoria}")
-    # NO se llama registrar_auditoria() porque guardaria firebase_uid
-
-    return jsonify({"status": "RECIBIDA", "ticket_id": ticket_id}), 201
-
-
-@app.route('/api/v1/denuncias-anonimas', methods=['GET'])
-def listar_denuncias_anonimas():
-    """Lista las denuncias anonimas (solo para Desk). NO requiere auth."""
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute(
-            "SELECT id, ticket_id, categoria, descripcion, evidencia_url, fecha, estado "
-            "FROM denuncias_anonimas ORDER BY id DESC"
-        )
-        filas = c.fetchall()
-    return jsonify([{
-        "id": f[0],
-        "ticket_id": f[1],
-        "categoria": f[2],
-        "descripcion": f[3],
-        "evidencia_url": f[4],
-        "fecha": f[5],
-        "estado": f[6],
-    } for f in filas]), 200
-
-
-@app.route('/api/v1/obtener-dictamenes', methods=['GET'])
-@limiter.limit("60 per minute")
-def obtener_dictamenes():
-    """
-    Retorna historial de dictamenes. Soporta filtro opcional.
-    
-    Query params:
-    - estado: Filtrar por estado_pipeline (ej: PROCESANDO, DICTAMINADO, ERROR)
-    
-    Response 200:
-    [
+    # Construir mensajes para Gemini (formato multimodal)
+    messages = [
         {
-            "id": 42,
-            "fecha": "2025-06-20T10:30:00",
-            "contexto": "Inspección...",
-            "tipificacion_legal": "NOM-123-STPS",
-            "responsabilidad": "DIRECTA",
-            "estado": "CRITICO",
-            "multa_minima": 1000,
-            "multa_maxima": 5000,
-            "firma_digital": "op_001",
-            "rol_supervisor": "OPERADOR",
-            "estado_pipeline": "DICTAMINADO",
-            "timestamp_recibido": "2025-06-20T10:30:00.123",
-            "timestamp_procesado": "2025-06-20T10:35:00.456",
-            "error_detalle": ""
+            "role": "user",
+            "content": f"{user_prompt}\n\n[IMAGEN ADJUNTA EN BASE64 - {len(contenido)} bytes]",
         }
     ]
-    """
-    filtro_estado = request.args.get('estado')
 
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        query = """SELECT id, fecha, contexto, tipificacion_legal, responsabilidad, estado,
-                          multa_minima, multa_maxima, firma_digital, rol_supervisor,
-                          estado_pipeline, timestamp_recibido, timestamp_procesado, error_detalle
-                   FROM dictamenes_stps_v2"""
-        params = ()
-        if filtro_estado:
-            query += " WHERE estado_pipeline = ?"
-            params = (filtro_estado,)
-        query += " ORDER BY id DESC"
-
-        c.execute(query, params)
-        filas = c.fetchall()
-
-    resultados = [{
-        "id": f[0],
-        "fecha": f[1],
-        "contexto": f[2],
-        "tipificacion_legal": f[3],
-        "responsabilidad": f[4],
-        "estado": f[5],
-        "multa_minima": f[6],
-        "multa_maxima": f[7],
-        "firma_digital": f[8],
-        "rol_supervisor": f[9],
-        "estado_pipeline": f[10],
-        "timestamp_recibido": f[11],
-        "timestamp_procesado": f[12],
-        "error_detalle": f[13],
-    } for f in filas]
-
-    return jsonify(resultados), 200
-
-
-@app.route('/api/v1/dictamen/<int:dictamen_id>', methods=['GET'])
-@limiter.limit("60 per minute")
-def obtener_dictamen_individual(dictamen_id):
-    """
-    Permite al móvil hacer polling puntual de un solo registro tras
-    recibir un 202 (modo rapido), en vez de repetir la consulta completa del historial.
-    
-    Response 200:
-    {
-        "id": 42,
-        "estado_pipeline": "DICTAMINADO",
-        "dictamen": { ... dictamen JSON ... },
-        "error_detalle": ""
-    }
-    
-    Response 404: Si el dictamen no existe
-    {
-        "error": "NO_ENCONTRADO",
-        "detalle": "El dictamen con ID 42 no existe."
-    }
-    """
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute('''SELECT id, estado_pipeline, dictamen_raw, error_detalle
-                     FROM dictamenes_stps_v2 WHERE id = ?''', (dictamen_id,))
-        fila = c.fetchone()
-
-    if fila is None:
-        return jsonify({
-            "error": "NO_ENCONTRADO",
-            "detalle": f"El dictamen con ID {dictamen_id} no existe."
-        }), 404
-
-    return jsonify({
-        "id": fila[0],
-        "estado_pipeline": fila[1],
-        "dictamen": json.loads(fila[2]) if fila[2] and fila[2] != "{}" else None,
-        "error_detalle": fila[3]
-    }), 200
-
-
-# ==========================================
-# ENDPOINTS NOM-035 (Psicosocial)
-# ==========================================
-
-@app.route('/api/v1/nom035/evaluar', methods=['POST'])
-@limiter.limit("30 per minute")
-@token_requerido
-def nom035_evaluar():
-    """
-    POST /api/v1/nom035/evaluar — Recibe un cuestionario NOM-035,
-    lo evalúa con el clasificador psicosocial y lo guarda en SQLite.
-
-    Request JSON (Autenticado con Bearer token):
-    {
-        "company_id": "proj_001",
-        "guia": "gi" | "gii" | "giii",
-        "respuestas": { "1": 2, "2": 3, ... },
-        "tam_empresa": "16-50" | "51+" (opcional, fuerza guía),
-        "trabajador_id": "opcional",
-        "nombre": "opcional",
-        "puesto": "opcional"
-    }
-
-    Response 201:
-    {
-        "status": "EVALUADO",
-        "evaluacion_id": 42,
-        "nivel_riesgo": "MEDIO",
-        "violencia_laboral": false,
-        "porcentaje_global": 45.5,
-        "requiere_profesional": false,
-        "dominios": { ... },
-        "alertas": [ ... ],
-        "toolbox": "..." | null
-    }
-    """
-    try:
-        data = request.get_json(force=True)
-    except Exception as e:
-        return jsonify({"error": "JSON_INVALIDO", "detalle": str(e)}), 422
-
-    company_id = data.get("company_id", "").strip()
-    guia = data.get("guia", "gi")
-    respuestas = data.get("respuestas", {})
-    tam_empresa = data.get("tam_empresa")
-    trabajador_id = data.get("trabajador_id", "")
-    nombre = data.get("nombre", "")
-    puesto = data.get("puesto", "")
-
-    if not company_id:
-        return jsonify({"error": "CAMPOS_REQUERIDOS", "detalle": "company_id es obligatorio"}), 422
-    if not respuestas or not isinstance(respuestas, dict):
-        return jsonify({"error": "CAMPOS_REQUERIDOS", "detalle": "respuestas (dict) es obligatorio"}), 422
+    logger.info("📸 [VISION] analizando imagen (%d bytes) contexto=%.60s", len(contenido), context[:60])
 
     try:
-        resultado = evaluar(respuestas, guia=guia, tid=trabajador_id,
-                            nom=nombre, puesto=puesto, tam=tam_empresa)
+        # Llamar a Gemini con la imagen en Base64
+        resultado = await llamar_gemini(messages, system_prompt)
+
+        # Parsear respuesta estructurada
+        contenido_texto = resultado.get("content", "")
+
+        # Extraer nivel de riesgo
+        nivel_riesgo = "Medio"
+        if any(w in contenido_texto.lower() for w in ["alto", "crítico", "grave", "inminente", "urgente"]):
+            nivel_riesgo = "Alto"
+        elif any(w in contenido_texto.lower() for w in ["bajo", "leve", "mínimo", "sin riesgo"]):
+            nivel_riesgo = "Bajo"
+
+        # Extraer NOMs mencionadas
+        import re
+        noms_encontradas = re.findall(r'NOM-\d{3}-STPS-\d{4}', contenido_texto)
+        nom_aplicable = ", ".join(noms_encontradas) if noms_encontradas else "NOM-017-STPS-2008 (EPP)"
+
+        duracion = round(time.time() - t_inicio, 2)
+
+        logger.info("📸 [VISION] completado en %.2fs | riesgo=%s | noms=%s", duracion, nivel_riesgo, nom_aplicable)
+
+        return {
+            "hallazgos": contenido_texto,
+            "nivel_riesgo": nivel_riesgo,
+            "nom_aplicable": nom_aplicable,
+            "accion_recomendada": "Verificar los hallazgos detectados y aplicar las NOMs correspondientes.",
+            "tiempo_s": duracion,
+        }
+
+    except RuntimeError as e:
+        logger.error("❌ [VISION] Error del proveedor: %s", e)
+        raise HTTPException(status_code=400, detail=f"Error al procesar la imagen: {e}")
     except Exception as e:
-        logger.error(f"❌ Error en clasificador psicosocial: {e}")
-        return jsonify({"error": "ERROR_CLASIFICACION", "detalle": str(e)}), 500
-
-    nivel = resultado.get("nv", "SR")
-    violencia = 1 if resultado.get("viol", False) else 0
-    prof = 1 if resultado.get("prof", False) else 0
-    dominios_json = json.dumps(resultado.get("doms", {}), ensure_ascii=False)
-    alertas = resultado.get("als", [])
-    alertas_json = json.dumps(alertas, ensure_ascii=False)
-    pctg = resultado.get("pctg", 0)
-    fecha = datetime.now().isoformat()
-
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute('''INSERT INTO evaluaciones_nom035
-                     (company_id, fecha, guia, nivel_riesgo, violencia_laboral,
-                      porcentaje_global, requiere_profesional, dominios_json, alertas_json)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                  (company_id, fecha, guia, nivel, violencia,
-                   pctg, prof, dominios_json, alertas_json))
-        conn.commit()
-        evaluacion_id = c.lastrowid
-
-    logger.info(f"📊 NOM-035 evaluado #{evaluacion_id} — company={company_id} nivel={nivel}")
-
-    return jsonify({
-        "status": "EVALUADO",
-        "evaluacion_id": evaluacion_id,
-        "nivel_riesgo": nivel,
-        "violencia_laboral": bool(violencia),
-        "porcentaje_global": pctg,
-        "requiere_profesional": bool(prof),
-        "dominios": resultado.get("doms", {}),
-        "alertas": alertas,
-        "toolbox": resultado.get("tb"),
-        "guia": resultado.get("guia"),
-        "norma": "NOM-035-STPS",
-    }), 201
+        logger.error("❌ [VISION] Error inesperado: %s", e)
+        raise HTTPException(status_code=500, detail="Error interno al analizar la imagen.")
 
 
-@app.route('/api/v1/nom035/resumen', methods=['GET'])
-@limiter.limit("60 per minute")
-@token_requerido
-def nom035_resumen():
+# ═══════════════════════════════════════════════════════════════════════════
+# ENDPOINTS: ATENEA TALENT — IPA, Matching, Validación de Habilidades
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/talent/calculate-ipa")
+async def talent_calculate_ipa(request: Request):
     """
-    GET /api/v1/nom035/resumen?company_id=proj_001 — Retorna agregado
-    de evaluaciones NOM-035 filtrado por company_id.
-
-    Query params:
-    - company_id (requerido): ID del proyecto/empresa
+    Calcula el Índice de Potencial Atenea (IPA) para un usuario.
+    
+    Request JSON:
+    {
+        "uid": "firebase_uid",
+        "cursos_completados": 5,
+        "cuestionarios_aprobados": 8,
+        "reportes_nearmiss": 12,
+        "charlas_asistidas": 20,
+        "karma_supervisor": 75,
+        "sellos_habilidad": 3,
+        "horas_capacitacion": 40
+    }
 
     Response 200:
     {
-        "total_evaluaciones": 42,
-        "distribucion_niveles": { "SR": 10, "BAJO": 15, "MEDIO": 12, "ALTO": 5 },
-        "pct_violencia": 7.1,
-        "pct_requiere_profesional": 11.9,
-        "dominios_criticos": [
-            { "dominio": "carga_trabajo", "nivel": "ALTO", "pct_afectacion": 35.0 }
-        ],
-        "alertas_clinicas": [
-            "Dom carga_trabajo: ALTO",
-            "VIOLENCIA DETECTADA"
-        ],
-        "toolboxes_pendientes": 15,
-        "ultima_evaluacion": "2025-07-29T12:00:00"
+        "ipa_total": 750,
+        "aprendizaje": 320,
+        "actitud_valores": 275,
+        "habilidad_ia": 225,
+        "nivel": "Avanzado",
+        "badges": ["🎓 Aprendiz Dedicado", "🛡️ Guardián de Seguridad", ...]
     }
     """
-    company_id = request.args.get("company_id", "").strip()
-    if not company_id:
-        return jsonify({"error": "CAMPOS_REQUERIDOS", "detalle": "company_id es requerido como query param"}), 422
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Body inválido. Se requiere JSON válido.")
 
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute('''SELECT id, nivel_riesgo, violencia_laboral, porcentaje_global,
-                            requiere_profesional, dominios_json, alertas_json, fecha
-                     FROM evaluaciones_nom035
-                     WHERE company_id = ?
-                     ORDER BY id DESC''', (company_id,))
-        filas = c.fetchall()
+    profile = {
+        "cursos_completados": body.get("cursos_completados", 0),
+        "cuestionarios_aprobados": body.get("cuestionarios_aprobados", 0),
+        "reportes_nearmiss": body.get("reportes_nearmiss", 0),
+        "charlas_asistidas": body.get("charlas_asistidas", 0),
+        "karma_supervisor": body.get("karma_supervisor", 0),
+        "sellos_habilidad": body.get("sellos_habilidad", 0),
+        "horas_capacitacion": body.get("horas_capacitacion", 0),
+    }
 
-    total = len(filas)
-    if total == 0:
-        return jsonify({
-            "total_evaluaciones": 0,
-            "distribucion_niveles": {"SR": 0, "BAJO": 0, "MEDIO": 0, "ALTO": 0, "MUY_ALTO": 0},
-            "pct_violencia": 0,
-            "pct_requiere_profesional": 0,
-            "dominios_criticos": [],
-            "alertas_clinicas": [],
-            "toolboxes_pendientes": 0,
-            "ultima_evaluacion": None
-        }), 200
+    resultado = calculate_ipa_components(profile)
+    logger.info("🧠 [TALENT] IPA calculado: %d (%s)", resultado["ipa_total"], resultado["nivel"])
 
-    niveles = {"SR": 0, "BAJO": 0, "MEDIO": 0, "ALTO": 0, "MUY_ALTO": 0}
-    violencia_count = 0
-    prof_count = 0
-    dominios_aggregated = {}
-    alertas_set = set()
-    toolboxes = 0
-    ultima_fecha = filas[0][7]
+    return resultado
 
-    for f in filas:
-        nv = f[1] if f[1] in niveles else "SR"
-        niveles[nv] += 1
-        violencia_count += f[2]
-        prof_count += f[4]
-        if not f[4]:
-            # Sin requerir profesional → toolbox pendiente
-            toolboxes += 1
 
-        # Agregar dominios
+@app.post("/api/talent/match")
+async def talent_match(request: Request):
+    """
+    Matching semántico de talento usando DeepSeek.
+    Evalúa potencial, NO años de experiencia.
+
+    Request JSON:
+    {
+        "candidato": { "ipa": {...}, "sellos": [...] },
+        "requisitos": { "ipa_minimo": 500, "habilidades": [...], "valores": [...] }
+    }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Body inválido.")
+
+    candidato = body.get("candidato", {})
+    requisitos = body.get("requisitos", {})
+
+    if not candidato or not requisitos:
+        raise HTTPException(status_code=422, detail="Se requieren 'candidato' y 'requisitos'.")
+
+    prompt = build_match_prompt(candidato, requisitos)
+    messages = [{"role": "user", "content": prompt}]
+
+    try:
+        resultado = await generar_respuesta_chat(
+            model="deepseek",
+            messages=messages,
+            system_prompt=MATCH_SYSTEM_PROMPT,
+        )
+        return {
+            "match_result": resultado.get("content", ""),
+            "model": resultado.get("model", "deepseek-chat"),
+        }
+    except Exception as e:
+        logger.error("❌ [TALENT] Error en matching: %s", e)
+        raise HTTPException(status_code=500, detail=f"Error en matching: {e}")
+
+
+@app.post("/api/talent/validate-skill")
+async def talent_validate_skill(request: Request):
+    """
+    Valida una habilidad demostrada por un trabajador usando IA.
+    Si aprueba, otorga un "Sello de Habilidad" que sube el IPA.
+
+    Request JSON:
+    {
+        "habilidad": "Manejo de Montacargas",
+        "evidencia": "descripción o transcripción de video/audio"
+    }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Body inválido.")
+
+    habilidad = body.get("habilidad", "")
+    evidencia = body.get("evidencia", "")
+
+    if not habilidad or not evidencia:
+        raise HTTPException(status_code=422, detail="Se requieren 'habilidad' y 'evidencia'.")
+
+    prompt = build_skill_validation_prompt(habilidad, evidencia)
+    messages = [{"role": "user", "content": prompt}]
+
+    try:
+        resultado = await generar_respuesta_chat(
+            model="claude",
+            messages=messages,
+            system_prompt=SKILL_VALIDATION_PROMPT,
+        )
+        return {
+            "validacion": resultado.get("content", ""),
+            "model": resultado.get("model", "claude-sonnet"),
+        }
+    except Exception as e:
+        logger.error("❌ [TALENT] Error en validación: %s", e)
+        raise HTTPException(status_code=500, detail=f"Error en validación: {e}")
+
+
+@app.get("/api/talent/skills")
+async def talent_skills_catalog():
+    """Retorna el catálogo de habilidades y sellos disponibles."""
+    return {
+        "skills": SKILL_CATALOG,
+        "total": len(SKILL_CATALOG),
+    }
+
+
+@app.get("/api/talent/roles")
+async def talent_roles_catalog():
+    """Retorna los roles de talento disponibles en la plataforma."""
+    return {"roles": TALENT_ROLES}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ENDPOINT: Webhook de WhatsApp (Ingesta de campo)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/webhooks/whatsapp")
+async def whatsapp_webhook(request: Request):
+    """
+    Webhook para recibir mensajes de WhatsApp (Twilio/Meta API).
+    Procesa texto e imágenes desde el campo y los estructura como reportes.
+
+    Request JSON:
+    {
+        "from": "+5215551234567",
+        "body": "Se cayó un andamio en la nave 3",
+        "image_url": "https://..."  // opcional
+    }
+
+    Response 200:
+    {
+        "ticket_type": "incidente",
+        "resumen": "texto estructurado",
+        "nivel_riesgo": "Alto" | "Medio" | "Bajo",
+        "datos_extraidos": {...}
+    }
+    """
+    import base64
+    import re
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Body inválido. Se requiere JSON válido.")
+
+    from_number = body.get("from", "desconocido")
+    message_body = body.get("body", "")
+    image_url = body.get("image_url", "")
+
+    if not message_body and not image_url:
+        raise HTTPException(status_code=422, detail="Se requiere 'body' o 'image_url' en el payload.")
+
+    logger.info("📱 [WHATSAPP] from=%s body=%.80s image=%s", from_number, message_body[:80], bool(image_url))
+
+    # ── Si hay imagen, enviar al Agente Visión ──
+    if image_url:
         try:
-            doms = json.loads(f[5]) if f[5] and f[5] != "{}" else {}
-        except json.JSONDecodeError:
-            doms = {}
-        for dk, dv in doms.items():
-            nv_dom = dv.get("nv", "SR") if isinstance(dv, dict) else "SR"
-            if dk not in dominios_aggregated:
-                dominios_aggregated[dk] = {"count": 0, "altos": 0}
-            dominios_aggregated[dk]["count"] += 1
-            if nv_dom in ("ALTO", "MUY_ALTO"):
-                dominios_aggregated[dk]["altos"] += 1
+            import urllib.request
 
-        # Agregar alertas
-        try:
-            als = json.loads(f[6]) if f[6] and f[6] != "[]" else []
-        except json.JSONDecodeError:
-            als = []
-        for a in als:
-            alertas_set.add(a)
+            # Descargar imagen desde URL
+            req = urllib.request.Request(image_url, headers={"User-Agent": "AteneaLab/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                img_bytes = resp.read()
 
-    dominios_criticos = [
-        {"dominio": dk, "nivel": "ALTO" if dv["altos"] > 0 else "MEDIO",
-         "pct_afectacion": round(dv["altos"] / dv["count"] * 100, 1)}
-        for dk, dv in sorted(dominios_aggregated.items())
-        if dv["altos"] > 0
-    ]
+            img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+            context = message_body or "Reporte de campo vía WhatsApp"
+            user_prompt = f"Contexto del reporte de campo: {context}\n\nAnaliza esta imagen de condiciones de seguridad."
 
-    return jsonify({
-        "total_evaluaciones": total,
-        "distribucion_niveles": niveles,
-        "pct_violencia": round(violencia_count / total * 100, 1),
-        "pct_requiere_profesional": round(prof_count / total * 100, 1),
-        "dominios_criticos": dominios_criticos,
-        "alertas_clinicas": sorted(alertas_set),
-        "toolboxes_pendientes": toolboxes,
-        "ultima_evaluacion": ultima_fecha,
-        "company_id": company_id,
-        "norma": "NOM-035-STPS"
-    }), 200
+            agent_config = get_agent_config("vision")
+            messages = [{"role": "user", "content": f"{user_prompt}\n\n[IMAGEN ADJUNTA]"}]
+
+            resultado = await llamar_gemini(messages, agent_config["prompt"])
+            hallazgos = resultado.get("content", "No se pudieron analizar los hallazgos.")
+
+            return {
+                "ticket_type": "inspeccion_visual",
+                "resumen": hallazgos,
+                "nivel_riesgo": "Medio",
+                "origen": f"whatsapp:{from_number}",
+                "datos_extraidos": {
+                    "telefono": from_number,
+                    "mensaje_original": message_body[:200],
+                    "imagen_procesada": True,
+                },
+            }
+
+        except Exception as e:
+            logger.error("❌ [WHATSAPP] Error procesando imagen: %s", e)
+            raise HTTPException(status_code=400, detail=f"Error al procesar la imagen: {e}")
+
+    # ── Solo texto: estructurar como reporte con Agente Legal ──
+    agent_config = get_agent_config("legal")
+    structuring_prompt = (
+        f"Estructura el siguiente mensaje de WhatsApp como un reporte de incidente de seguridad:\n\n"
+        f"Mensaje: \"{message_body}\"\n\n"
+        f"Responde en formato JSON con: tipo_incidente, descripcion, nivel_riesgo (Alto/Medio/Bajo), "
+        f"ubicacion (si se menciona), personas_involucradas (si se menciona), accion_inmediata."
+    )
+
+    messages = [{"role": "user", "content": structuring_prompt}]
+
+    try:
+        resultado = await generar_respuesta_chat(
+            model="claude",
+            messages=messages,
+            system_prompt=agent_config["prompt"],
+        )
+
+        contenido = resultado.get("content", "")
+
+        # Intentar parsear JSON de la respuesta
+        datos = {
+            "ticket_type": "incidente",
+            "resumen": contenido,
+            "nivel_riesgo": "Medio",
+            "origen": f"whatsapp:{from_number}",
+            "datos_extraidos": {
+                "telefono": from_number,
+                "mensaje_original": message_body[:200],
+            },
+        }
+
+        # Detectar nivel de riesgo del texto
+        if any(w in message_body.lower() for w in ["cayó", "fuego", "explosión", "muerto", "herido", "grave", "accidente"]):
+            datos["nivel_riesgo"] = "Alto"
+        elif any(w in message_body.lower() for w in ["falta", "roto", "vencido", "sin", "peligro"]):
+            datos["nivel_riesgo"] = "Medio"
+
+        return datos
+
+    except Exception as e:
+        logger.error("❌ [WHATSAPP] Error del agente: %s", e)
+        raise HTTPException(status_code=500, detail=f"Error al procesar el mensaje: {e}")
 
 
-if __name__ == '__main__':
-    debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
-    logger.info("🚀 Iniciando Atenea Backend Fase 1 - Entrypoint único: main.py")
-    logger.info(f"🔧 Modo debug: {'ACTIVADO' if debug_mode else 'DESACTIVADO'} (variable FLASK_DEBUG)")
+# ═══════════════════════════════════════════════════════════════════════════
+# ENTRYPOINT (ejecución directa con python main.py)
+# ═══════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.environ.get("PORT", 8000))
+    debug = os.environ.get("DEBUG", "False").lower() == "true"
+
+    logger.info("🚀 Iniciando Atenea Chat Backend (FastAPI)")
+    logger.info("🔧 Debug: %s", "ACTIVADO" if debug else "DESACTIVADO")
     logger.info("📡 Endpoints disponibles:")
-    logger.info("   GET  /api/v1/health")
-    logger.info("   POST /api/v1/orquestar-emergencia")
-    logger.info("   GET  /api/v1/dictamen/<id>")
-    logger.info("   GET  /api/v1/obtener-dictamenes")
-    logger.info("   POST /api/v1/denuncias-anonimas (anonimo, sin Auth)")
-    logger.info("   GET  /api/v1/denuncias-anonimas")
-    logger.info("   GET  /dashboard")
-    app.run(host='0.0.0.0', port=5000, debug=debug_mode, threaded=True)
+    logger.info("   GET  /health")
+    logger.info("   POST /api/chat  (requiere auth Premium)")
+    logger.info("🌐 CORS allowed origins: %s", ALLOWED_ORIGINS)
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
+        reload=debug,
+    )  
