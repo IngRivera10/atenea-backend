@@ -61,7 +61,8 @@ app = FastAPI(
 ALLOWED_ORIGINS = [
     "https://app.atenealabmx.com",
     "http://localhost:5173",  # Para desarrollo local
-    "https://ateneadesk.vercel.app" # Por si acaso
+    "https://ateneadesk.vercel.app", # Sin guión (despliegue actual)
+    "https://atenea-desk.vercel.app", # Con guión (despliegue alternativo)
 ]
 
 app.add_middleware(
