@@ -73,43 +73,43 @@ Reglas:
 5. NUNCA sustituyas a un abogado real — esto es orientación preventiva.
 6. Usa el contexto de NOMs proporcionado cuando cites normativas específicas."""
 
-AGENT_GLM_PROMPT = """Eres el ingeniero de estructuración de datos de Atenea Lab.
-Especialista en generar documentos estructurados, Excel, PPT y reportes ejecutivos.
+AGENT_OPENAI_PROMPT = """Eres el asistente enterprise de Atenea Lab para consultas complejas y multi-agente.
+Tienes acceso a herramientas de análisis profundo y generación de documentos ejecutivos.
 
 Especialidades:
-- Convertir datos de incidentes en reportes Excel formateados.
-- Generar presentaciones PPT ejecutivas con gráficos y KPIs.
-- Estructurar datos en tablas, CSV, y formatos exportables.
-- Crear manuales de seguridad estructurados capítulo por capítulo.
-- Organizar grandes volúmenes de datos en formatos empresariales.
+- Redactar informes ejecutivos y resúmenes para dirección.
+- Analizar datos complejos y generar visualizaciones.
+- Integrar información de múltiples fuentes (legal, operativa, financiera).
+- Resolver consultas ambiguas que requieren razonamiento cruzado.
+- Generar planes de acción estratégicos.
 
 Reglas:
-1. Responde siempre con datos estructurados (tablas, listas, formato exportable).
-2. Usa formato Markdown con tablas cuando sea posible.
-3. Organiza jerárquicamente (Capítulo > Sección > Subsección).
-4. Responde en español de México."""
+1. Responde en español de México, tono ejecutivo profesional.
+2. Estructura: Resumen Ejecutivo > Análisis > Recomendaciones.
+3. Cita fuentes y datos cuando sea relevante.
+4. Si la consulta requiere datos específicos, solicítalos antes de responder.
+5. Para consultas legales, sugiere consultar con el agente Legal (Claude)."""
 
-AGENT_HUNYUAN_PROMPT = """Eres el consultor empresarial de Atenea Lab.
-Generas presentaciones, resúmenes ejecutivos y comunicaciones corporativas de alto nivel.
+AGENT_OPENAI_MINI_PROMPT = """Eres el asistente de soporte rápido de Atenea Lab Desk.
+Ayudas a los usuarios a usar la plataforma de forma eficiente.
 
 Especialidades:
-- Generar resúmenes ejecutivos para gerencia y dirección.
-- Crear contenido para presentaciones corporativas (PPT/Google Slides).
-- Redactar comunicados de seguridad para toda la empresa.
-- Estructurar reportes ESG (Environmental, Social, Governance).
-- Preparar dashboards narrativos para juntas directivas.
+- Explicar cómo usar cualquier función de la app.
+- Responder preguntas frecuentes (FAQ).
+- Guiar en flujos de trabajo (checklists, reportes, dictámenes).
+- Solucionar problemas comunes.
 
 Reglas:
-1. Lenguaje ejecutivo, profesional, orientado a resultados.
-2. Estructura clara: Resumen Ejecutivo > Análisis > Recomendaciones.
-3. Incluye métricas y KPIs cuando sea relevante.
-4. Responde en español de México, tono corporativo."""
+1. Responde en español de México, tono amigable y claro.
+2. Sé conciso: respuestas de máximo 3 párrafos.
+3. Si no sabes algo, redirige al agente especializado.
+4. NUNCA des consejos legales o médicos."""
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# AGENTE DEFAULT (DeepSeek — más barato y versátil)
+# AGENTE DEFAULT (GPT-4o-mini — soporte rápido, 0 créditos)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-AGENT_DEFAULT_PROMPT = AGENT_DEEPSEEK_PROMPT
+AGENT_DEFAULT_PROMPT = AGENT_OPENAI_MINI_PROMPT
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAPEO DE AGENT_TYPE → CONFIGURACIÓN (incluye costo en créditos)
@@ -118,11 +118,26 @@ AGENT_DEFAULT_PROMPT = AGENT_DEEPSEEK_PROMPT
 AGENT_TYPE_MAPPING = {
     "deepseek": {
         "model": "deepseek",
-        "label": "🧠 DeepSeek (Análisis)",
+        "label": "DeepSeek (Análisis)",
         "prompt": AGENT_DEEPSEEK_PROMPT,
-        "description": "Orquestador principal: OEE, IPERC, matemáticas, lógica, código",
+        "description": "Análisis, OEE, IPERC, matemáticas, código",
         "credits": 1,
     },
+    "gemini": {
+        "model": "gemini",
+        "label": "Gemini (Visión)",
+        "prompt": AGENT_GEMINI_PROMPT,
+        "description": "Análisis visual, fotos, audio, video",
+        "credits": 1,
+    },
+    "claude": {
+        "model": "claude",
+        "label": "Claude (Legal)",
+        "prompt": AGENT_CLAUDE_PROMPT,
+        "description": "Asesoría legal STPS, NOMs, dictámenes, DC3/DC5",
+        "credits": 3,
+    },
+    # Aliases internos usados por endpoints existentes (vision/legal).
     "vision": {
         "model": "gemini",
         "label": "👁 Inspector (Foto/Audio)",
@@ -137,47 +152,19 @@ AGENT_TYPE_MAPPING = {
         "description": "Asesoría legal, NOMs, multas STPS, DC3/DC5",
         "credits": 3,
     },
-    "glm": {
-        "model": "glm",
-        "label": "📋 GLM-4 (Documentos)",
-        "prompt": AGENT_GLM_PROMPT,
-        "description": "Estructuración Excel, PPT, reportes y manuales (Premium, 2 créditos)",
+    "openai": {
+        "model": "openai",
+        "label": "GPT-4o (Enterprise)",
+        "prompt": AGENT_OPENAI_PROMPT,
+        "description": "Consultas complejas, enterprise, multi-agente",
         "credits": 2,
     },
-    "flash": {
-        "model": "flash",
-        "label": "⚡ Flash (Gratis)",
-        "prompt": AGENT_GLM_PROMPT,
-        "description": "Consultas rápidas y soporte de campo vía GLM-4-Flash (GRATIS, 0 créditos)",
+    "openai-mini": {
+        "model": "openai-mini",
+        "label": "GPT-4o-mini (Soporte)",
+        "prompt": AGENT_OPENAI_MINI_PROMPT,
+        "description": "Soporte rápido, FAQ, cómo usar la app",
         "credits": 0,
-    },
-    "hunyuan": {
-        "model": "hunyuan",
-        "label": "🏢 Hunyuan (Ejecutivo)",
-        "prompt": AGENT_HUNYUAN_PROMPT,
-        "description": "Presentaciones, ESG, resúmenes ejecutivos",
-        "credits": 2,
-    },
-    "kimi": {
-        "model": "kimi",
-        "label": "💻 Kimi K2.7 Code",
-        "prompt": AGENT_GLM_PROMPT,
-        "description": "Modelo de código y desarrollo avanzado (Kimi K2.7)",
-        "credits": 1,
-    },
-    "minimax": {
-        "model": "minimax",
-        "label": "⚡ Minimax M3",
-        "prompt": AGENT_GLM_PROMPT,
-        "description": "Modelo generalista de alto rendimiento (Minimax M3)",
-        "credits": 1,
-    },
-    "glm52": {
-        "model": "glm52",
-        "label": "🎯 GLM 5.2 Pro",
-        "prompt": AGENT_GLM_PROMPT,
-        "description": "Modelo premium de razonamiento y análisis (GLM 5.2)",
-        "credits": 2,
     },
 }
 
@@ -193,154 +180,26 @@ PROVIDER_CONFIG = {
         "temperature": 0.7,
     },
     "gemini": {
-        "model_name": "gemini-2.0-flash",
+        "model_name": "gemini-2.5-flash",
         "max_tokens": 2048,
         "temperature": 0.7,
     },
     "claude": {
-        "model_name": "claude-sonnet-4-20250514",
+        "model_name": "claude-sonnet-5",
         "max_tokens": 2048,
         "temperature": 0.7,
     },
-    "glm": {
-        "model_name": "glm-4",
-        "provider": "zhipu_direct",
-        "base_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-        "max_tokens": 2048,
+    "openai": {
+        "model_name": "gpt-4o",
+        "max_tokens": 4096,
         "temperature": 0.7,
     },
-    "flash": {
-        "model_name": "glm-4-flash",
-        "provider": "zhipu_direct",
-        "base_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-        "max_tokens": 2048,
-        "temperature": 0.7,
-    },
-    "hunyuan": {
-        "model_name": "hy3",
-        "provider": "tokenhub_direct",
-        "base_url_direct": "https://tokenhub-intl.tencentcloudmaas.com/v1/chat/completions",
-        "model_direct": "hy3",
-        "max_tokens": 2048,
-        "temperature": 0.7,
-    },
-    "kimi": {
-        "model_name": "kimi-k2.7-code",
-        "provider": "zhipu_direct",
-        "base_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-        "max_tokens": 2048,
-        "temperature": 0.7,
-    },
-    "minimax": {
-        "model_name": "minimax-m3",
-        "provider": "zhipu_direct",
-        "base_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-        "max_tokens": 2048,
-        "temperature": 0.7,
-    },
-    "glm52": {
-        "model_name": "glm-5.2",
-        "provider": "zhipu_direct",
-        "base_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+    "openai-mini": {
+        "model_name": "gpt-4o-mini",
         "max_tokens": 2048,
         "temperature": 0.7,
     },
 }
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ZHIPU AI (BigModel) — Conexión directa, sin OpenRouter
-# ═══════════════════════════════════════════════════════════════════════════════
-
-ZHIPU_BASE_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-
-
-async def call_zhipu_direct(model: str, messages: list[dict], system_prompt: str = "") -> dict:
-    """
-    Llama directamente a la API de Zhipu AI (BigModel) usando ZHIPU_API_KEY.
-    Endpoint OpenAI-compatible. Usado por GLM-4 (glm) y GLM-4-Flash (flash).
-
-    Args:
-        model: ID del modelo en Zhipu (ej: "glm-4" o "glm-4-flash").
-        messages: Lista de mensajes [{"role": "user"|"assistant", "content": "..."}].
-        system_prompt: Instrucción de sistema opcional.
-
-    Returns:
-        {
-            "content": str,
-            "model": str,
-            "tokens_entrada": int,
-            "tokens_salida": int,
-            "costo_usd": float,
-            "tiempo_s": float,
-        }
-    """
-    import os
-    import time
-    import aiohttp
-    import logging
-
-    logger = logging.getLogger(__name__)
-    api_key = os.environ.get("ZHIPU_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("ZHIPU_API_KEY no configurada en variables de entorno")
-
-    inicio = time.time()
-
-    # Construir payload OpenAI-compatible
-    openai_messages = []
-    if system_prompt:
-        openai_messages.append({"role": "system", "content": system_prompt})
-    for m in messages:
-        openai_messages.append({"role": m["role"], "content": m["content"]})
-
-    payload = {
-        "model": model,
-        "messages": openai_messages,
-        "max_tokens": 2048,
-        "temperature": 0.7,
-    }
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                ZHIPU_BASE_URL, json=payload, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    raise RuntimeError(f"Zhipu HTTP {resp.status}: {error_text[:200]}")
-
-                data = await resp.json()
-                duracion = round(time.time() - inicio, 2)
-
-                choice = data.get("choices", [{}])[0]
-                contenido = choice.get("message", {}).get("content", "")
-                uso = data.get("usage", {})
-                tokens_entrada = uso.get("prompt_tokens", 0)
-                tokens_salida = uso.get("completion_tokens", 0)
-
-                logger.info(
-                    "🐉 [ZHIPU] %s | %d in / %d out tokens | %.2fs",
-                    model, tokens_entrada, tokens_salida, duracion,
-                )
-
-                return {
-                    "content": contenido,
-                    "model": model,
-                    "tokens_entrada": tokens_entrada,
-                    "tokens_salida": tokens_salida,
-                    "costo_usd": 0.0,  # Zhipu directo: sin costo de pasarela
-                    "tiempo_s": duracion,
-                }
-
-    except aiohttp.ClientError as e:
-        logger.error("❌ [ZHIPU] Error de conexión: %s", e)
-        raise RuntimeError(f"Zhipu no disponible: {e}") from e
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SISTEMA DE CRÉDITOS
@@ -361,104 +220,6 @@ def validate_credits(agent_type: str, balance: int) -> tuple[bool, str]:
     if balance < required:
         return False, f"Créditos Atenea insuficientes. Requeridos: {required}, Disponibles: {balance}"
     return True, ""
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# OPENROUTER — Pasarela unificada para GLM y Hunyuan
-# ═══════════════════════════════════════════════════════════════════════════════
-
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
-
-
-async def call_open_router(model: str, messages: list[dict], system_prompt: str = "") -> dict:
-    """
-    Llama a OpenRouter como pasarela unificada para modelos que no tienen API directa.
-    Usado por GLM (zhipu/glm-4) y Hunyuan (tencent/hunyuan-lite).
-
-    Args:
-        model: ID del modelo en OpenRouter (ej: "zhipu/glm-4")
-        messages: Lista de mensajes [{"role": "user"|"assistant", "content": "..."}]
-        system_prompt: Instrucción de sistema opcional
-
-    Returns:
-        {
-            "content": str,
-            "model": str,
-            "tokens_entrada": int,
-            "tokens_salida": int,
-            "costo_usd": float,
-            "tiempo_s": float
-        }
-    """
-    import os
-    import time
-    import aiohttp
-    import logging
-
-    logger = logging.getLogger(__name__)
-    api_key = os.environ.get("OPENROUTER_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("OPENROUTER_API_KEY no configurada en variables de entorno")
-
-    inicio = time.time()
-
-    # Construir payload OpenAI-compatible
-    openai_messages = []
-    if system_prompt:
-        openai_messages.append({"role": "system", "content": system_prompt})
-    for m in messages:
-        openai_messages.append({"role": m["role"], "content": m["content"]})
-
-    payload = {
-        "model": model,
-        "messages": openai_messages,
-        "max_tokens": 2048,
-        "temperature": 0.7,
-    }
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://atenealab.mx",
-        "X-Title": "Atenea Lab Desk",
-    }
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(OPENROUTER_BASE_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    raise RuntimeError(f"OpenRouter HTTP {resp.status}: {error_text[:200]}")
-
-                data = await resp.json()
-                duracion = round(time.time() - inicio, 2)
-
-                choice = data.get("choices", [{}])[0]
-                contenido = choice.get("message", {}).get("content", "")
-                uso = data.get("usage", {})
-                tokens_entrada = uso.get("prompt_tokens", 0)
-                tokens_salida = uso.get("completion_tokens", 0)
-
-                # Costo estimado genérico para OpenRouter
-                costo = (tokens_entrada * 0.5 / 1_000_000) + (tokens_salida * 1.5 / 1_000_000)
-
-                logger.info(
-                    "🌐 [OPENROUTER] %s | %d in / %d out tokens | %.2fs | $%.6f USD",
-                    model, tokens_entrada, tokens_salida, duracion, costo,
-                )
-
-                return {
-                    "content": contenido,
-                    "model": model,
-                    "tokens_entrada": tokens_entrada,
-                    "tokens_salida": tokens_salida,
-                    "costo_usd": round(costo, 6),
-                    "tiempo_s": duracion,
-                }
-
-    except aiohttp.ClientError as e:
-        logger.error("❌ [OPENROUTER] Error de conexión: %s", e)
-        raise RuntimeError(f"OpenRouter no disponible: {e}") from e
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

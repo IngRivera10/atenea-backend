@@ -96,9 +96,19 @@ def verificar_id_token(id_token: str) -> dict:
         ValueError: Si el token es inválido, expirado o revocado
     """
     try:
-        decoded = auth.verify_id_token(id_token)
+        # [E2.1] check_revoked=True: un ID Token revocado queda bloqueado.
+        # Complementa Firestore disabled como segunda capa.
+        decoded = auth.verify_id_token(id_token, check_revoked=True)
         logger.debug("🔐 Token verificado: uid=%s email=%s", decoded.get("uid"), decoded.get("email"))
         return decoded
+    except auth.UserDisabledError:
+        # [E2.1] Cuenta suspendida en Firebase Auth (Capa 1) -> 403, no 401.
+        # HTTPException NO es ValueError: _extract_and_verify_token no lo
+        # re-mapea a 401, se propaga con su 403.
+        raise HTTPException(
+            status_code=403,
+            detail="Cuenta deshabilitada. Vuelve a iniciar sesión.",
+        )
     except auth.ExpiredIdTokenError:
         raise ValueError("Token expirado. Vuelve a iniciar sesión.")
     except auth.RevokedIdTokenError:
@@ -107,7 +117,7 @@ def verificar_id_token(id_token: str) -> dict:
         raise ValueError("Token inválido. Vuelve a iniciar sesión.")
     except Exception as e:
         logger.error("❌ Error verificando token: %s", e)
-        raise ValueError(f"Error de autenticación: {e}")
+        raise ValueError("Error de autenticación.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -142,6 +152,14 @@ def verificar_plan_premium(uid: str) -> bool:
             return False
 
         user_data = doc.to_dict()
+        # [ARCH] E1.1-05: FAIL-CLOSED — un usuario disabled nunca obtiene
+        # Premium aunque tenga plan=premium o role=admin. Esto es la Capa 1
+        # (authorization flag en Firestore); la Capa 2 (Firebase Auth disabled
+        # vía Admin SDK) se integra en E2.
+        if user_data.get("disabled") is True:
+            logger.warning("🚫 Usuario %s está disabled — acceso denegado", uid)
+            return False
+
         plan = user_data.get("plan", "free")
         role = user_data.get("role", "")
 
@@ -169,6 +187,70 @@ def verificar_plan_premium(uid: str) -> bool:
 from fastapi import Header, HTTPException
 
 
+async def _extract_and_verify_token(authorization: Optional[str]) -> dict:
+    """
+    [ARCH] Paso común de extracción y verificación de token Firebase.
+    Extraído para evitar duplicación entre verificar_acceso_premium y
+    verificar_identidad. Ambos necesitan validar el token; la diferencia
+    está en qué hacen después (plan premium vs. solo identidad).
+
+    Raises:
+        HTTPException 401: Si no hay token, formato inválido, o token inválido/expirado.
+    """
+    # Inicializar Firebase Admin (lazy, solo cuando se use)
+    _init_firebase()
+
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Token de autenticación requerido. Incluye 'Authorization: Bearer <id_token>'",
+        )
+
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(
+            status_code=401,
+            detail="Formato de autorización inválido. Usa 'Bearer <id_token>'",
+        )
+
+    id_token = parts[1]
+
+    try:
+        decoded = verificar_id_token(id_token)
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+    return decoded
+
+
+async def verificar_identidad(
+    authorization: Optional[str] = Header(None),
+) -> dict:
+    """
+    [ARCH] Dependencia FastAPI que verifica SOLO la identidad (token Firebase
+    válido). No exige plan Premium. Usar en endpoints que consumen recursos
+    de IA pero no requieren suscripción de pago (ej: /api/vision/inspect,
+    /api/talent/*).
+
+    A diferencia de verificar_acceso_premium, NO consulta Firestore para
+    verificar el plan — solo valida que el token sea legítimo.
+
+    Returns:
+        dict con uid y email del usuario verificado.
+
+    Raises:
+        HTTPException 401: Si no hay token o es inválido.
+    """
+    decoded = await _extract_and_verify_token(authorization)
+    uid = decoded.get("uid")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Token válido pero sin uid. Re-autentica.")
+    return {
+        "uid": uid,
+        "email": decoded.get("email", "desconocido"),
+    }
+
+
 async def verificar_acceso_premium(
     authorization: Optional[str] = Header(None),
 ) -> dict:
@@ -183,39 +265,17 @@ async def verificar_acceso_premium(
         authorization: Header HTTP "Authorization: Bearer <id_token>"
 
     Returns:
-        dict con uid, email, plan, role del usuario verificado
+        dict con uid, email del usuario verificado
 
     Raises:
         HTTPException 401: Si no hay token o es inválido
         HTTPException 403: Si el usuario no tiene plan Premium
     """
-    # Inicializar Firebase Admin (lazy, solo cuando se use)
-    _init_firebase()
-
-    # 1. Verificar que existe el header Authorization
-    if not authorization:
-        raise HTTPException(
-            status_code=401,
-            detail="Token de autenticación requerido. Incluye 'Authorization: Bearer <id_token>'",
-        )
-
-    # 2. Extraer el token del header "Bearer <token>"
-    parts = authorization.split()
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        raise HTTPException(
-            status_code=401,
-            detail="Formato de autorización inválido. Usa 'Bearer <id_token>'",
-        )
-
-    id_token = parts[1]
-
-    # 3. Verificar el ID Token con Firebase Auth
-    try:
-        decoded = verificar_id_token(id_token)
-    except ValueError as e:
-        raise HTTPException(status_code=401, detail=str(e))
+    decoded = await _extract_and_verify_token(authorization)
 
     uid = decoded.get("uid")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Token válido pero sin uid. Re-autentica.")
     email = decoded.get("email", "desconocido")
 
     # 4. Verificar plan Premium en Firestore

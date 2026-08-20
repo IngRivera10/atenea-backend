@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from openai import AsyncOpenAI
 
 # Asegurar que core/ está en el path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -32,8 +33,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 load_dotenv()
 
 from core.chat_multiagente import generar_respuesta_chat, llamar_gemini
-from core.auth_middleware import verificar_acceso_premium
-from agents_config import get_agent_config, list_agents, AGENT_DEFAULT_PROMPT, validate_credits, get_agent_credits, PROVIDER_CONFIG, OPENROUTER_BASE_URL, call_zhipu_direct
+from core.auth_middleware import verificar_acceso_premium, verificar_identidad
+from agents_config import get_agent_config, list_agents, AGENT_DEFAULT_PROMPT, validate_credits, get_agent_credits, PROVIDER_CONFIG
 from talent_engine import calculate_ipa_components, build_match_prompt, build_skill_validation_prompt, MATCH_SYSTEM_PROMPT, SKILL_VALIDATION_PROMPT, SKILL_CATALOG, TALENT_ROLES
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -46,6 +47,14 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Cliente OpenAI (para GPT-4o y GPT-4o-mini)
+openai_client = None
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+if OPENAI_API_KEY:
+    openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+else:
+    logger.warning("⚠️ OPENAI_API_KEY no configurada. Agentes OpenAI no estarán disponibles.")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # APP FASTAPI
@@ -103,151 +112,6 @@ MODERATION_RESPONSES = {
     "jailbreak": "Soy un asistente de capacitación de Atenea Lab Desk. Solo puedo ayudarte con dudas sobre el uso de la plataforma.",
     "medical": "No puedo evaluar situaciones reales de seguridad. Si hay un riesgo inminente, sigue tu protocolo de emergencia y contacta a tu supervisor de seguridad.",
 }
-
-
-async def call_glm_direct(prompt: str, agent_config: dict) -> str:
-    """
-    Llama directamente a la API de Zhipu (BigModel) para GLM 5.2 usando GLM_API_KEY.
-
-    Args:
-        prompt: Texto del usuario (último mensaje).
-        agent_config: Configuración del agente GLM (de AGENT_TYPE_MAPPING).
-
-    Returns:
-        str con el contenido de la respuesta del modelo.
-
-    Raises:
-        RuntimeError: si GLM_API_KEY no está configurada o falla la petición.
-    """
-    import os
-    import time
-    import aiohttp
-
-    api_key = os.environ.get("GLM_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("GLM_API_KEY no configurada en variables de entorno")
-
-    glm_provider_cfg = PROVIDER_CONFIG.get("glm", {})
-    base_url_direct = glm_provider_cfg.get(
-        "base_url_direct", "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-    )
-    model_name_direct = glm_provider_cfg.get("model_name_direct", "glm-5.2")
-    system_prompt = agent_config.get("prompt", "")
-
-    inicio = time.time()
-    openai_messages = []
-    if system_prompt:
-        openai_messages.append({"role": "system", "content": system_prompt})
-    openai_messages.append({"role": "user", "content": prompt})
-
-    payload = {
-        "model": model_name_direct,
-        "messages": openai_messages,
-        "max_tokens": glm_provider_cfg.get("max_tokens", 2048),
-        "temperature": glm_provider_cfg.get("temperature", 0.7),
-    }
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                base_url_direct, json=payload, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    raise RuntimeError(f"GLM Direct HTTP {resp.status}: {error_text[:200]}")
-                data = await resp.json()
-                duracion = round(time.time() - inicio, 2)
-                contenido = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                uso = data.get("usage", {})
-                logger.info(
-                    "🟢 [GLM-DIRECT] %s | %d in / %d out tokens | %.2fs",
-                    model_name_direct,
-                    uso.get("prompt_tokens", 0),
-                    uso.get("completion_tokens", 0),
-                    duracion,
-                )
-                return contenido
-    except aiohttp.ClientError as e:
-        logger.error("❌ [GLM-DIRECT] Error de conexión: %s", e)
-        raise RuntimeError(f"GLM Direct no disponible: {e}") from e
-
-
-async def call_tokenhub_direct(prompt: str, agent_config: dict) -> str:
-    """
-    Llama directamente a TokenHub (Tencent Cloud MAAS) para Hy3.
-    Chat Completions API estandar. Usa TOKENHUB_API_KEY.
-
-    Args:
-        prompt: Texto del usuario (ultimo mensaje).
-        agent_config: Configuración del agente Hunyuan (de AGENT_TYPE_MAPPING / PROVIDER_CONFIG).
-
-    Returns:
-        str con el contenido de la respuesta del modelo.
-
-    Raises:
-        RuntimeError: si TOKENHUB_API_KEY no esta configurada o falla la peticion.
-    """
-    import os
-    import time
-    import aiohttp
-
-    api_key = os.environ.get("TOKENHUB_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("TOKENHUB_API_KEY no configurada en variables de entorno")
-
-    hy3_cfg = PROVIDER_CONFIG.get("hunyuan", {})
-    base_url = hy3_cfg.get("base_url_direct", "https://tokenhub-intl.tencentcloudmaas.com/v1/chat/completions")
-    model_id = hy3_cfg.get("model_direct", "hy3")
-    system_prompt = agent_config.get("prompt", "")
-
-    inicio = time.time()
-    openai_messages = []
-    if system_prompt:
-        openai_messages.append({"role": "system", "content": system_prompt})
-    openai_messages.append({"role": "user", "content": prompt})
-
-    payload = {
-        "model": model_id,
-        "messages": openai_messages,
-        "max_tokens": hy3_cfg.get("max_tokens", 2048),
-        "temperature": hy3_cfg.get("temperature", 0.7),
-    }
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                base_url, json=payload, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    raise RuntimeError(f"TokenHub HTTP {resp.status}: {error_text[:200]}")
-                data = await resp.json()
-                duracion = round(time.time() - inicio, 2)
-                contenido = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                uso = data.get("usage", {})
-                logger.info(
-                    "🟣 [TOKENHUB] %s | %d in / %d out tokens | %.2fs",
-                    model_id,
-                    uso.get("prompt_tokens", 0),
-                    uso.get("completion_tokens", 0),
-                    duracion,
-                )
-                return contenido
-    except aiohttp.ClientError as e:
-        logger.error("❌ [TOKENHUB] Error de conexión: %s", e)
-        raise RuntimeError(f"TokenHub no disponible: {e}") from e
 
 
 def detectar_categoria_backend(texto: str) -> str | None:
@@ -320,6 +184,52 @@ async def agents_list_endpoint():
     }
 
 
+@app.post("/api/capacitacion")
+@limiter.limit("30/minute")
+async def capacitacion_endpoint(
+    request: Request,
+    user: dict = Depends(verificar_identidad),
+):
+    """
+    Endpoint de modo capacitación — responde preguntas educativas
+    sobre seguridad STPS, uso de la app, y normativa.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Body inválido.")
+
+    mensaje = body.get("mensaje", "").strip()
+    if not mensaje:
+        raise HTTPException(status_code=422, detail="Campo 'mensaje' requerido.")
+
+    faqs = body.get("faqs", [])
+    historial = body.get("historial", [])
+
+    from core.chat_capacitacion import procesar_consulta_capacitacion
+    import anthropic
+
+    cliente = None
+    try:
+        cliente = anthropic.Anthropic()
+    except Exception:
+        pass
+
+    resultado = procesar_consulta_capacitacion(
+        mensaje_usuario=mensaje,
+        faqs=faqs,
+        historial_conversacion=historial,
+        cliente_anthropic=cliente,
+    )
+
+    return {
+        "respuesta": resultado["respuesta"],
+        "modelo_usado": resultado["modelo_usado"],
+        "es_emergencia": resultado["es_emergencia"],
+        "escalado_a_sonnet": resultado["escalado_a_sonnet"],
+    }
+
+
 @app.post("/api/chat")
 @limiter.limit("20/minute")
 async def chat_endpoint(
@@ -377,19 +287,20 @@ async def chat_endpoint(
     # Determinar configuración del agente según agent_type
     agent_config = get_agent_config(agent_type if agent_type else "deepseek")
 
-    # ── Middleware de Créditos Atenea ──
-    company_id = context.get("companyId") or user.get("company_id", "")
-    credits_balance = context.get("creditsBalance", 999)  # TODO: leer de Firestore en producción
-    is_valid, credit_msg = validate_credits(agent_type, credits_balance)
-    if not is_valid:
-        raise HTTPException(status_code=402, detail=credit_msg)
+    # [ARCH] F-04: Créditos deshabilitados hasta que exista fuente autoritativa.
+    # El valor context.creditsBalance enviado por el cliente NO es confiable.
+    # La autorización económica requiere una colección Firestore con saldo real,
+    # debitada atómicamente por el servidor. Mientras tanto, el acceso se
+    # controla exclusivamente por plan Premium (verificado arriba).
+    # TODO: Implementar credits/balance en users/{uid} en Firestore.
+    # Referencia: validate_credits() en agents_config.py define el costo por agente.
 
     # Si no se especifica model explícito, usar el del agente
     if not model:
         model = agent_config["model"]
 
     # Validar modelo resultante
-    VALID_MODELS = ("claude", "gemini", "deepseek", "glm", "flash", "hunyuan", "kimi", "minimax", "glm52")
+    VALID_MODELS = ("claude", "gemini", "deepseek", "openai", "openai-mini")
     if model not in VALID_MODELS:
         raise HTTPException(
             status_code=422,
@@ -465,52 +376,49 @@ async def chat_endpoint(
         uid, email, agent_type, model, len(messages),
     )
 
-    # Invocar al proveedor de IA
+    # Enrutamiento según proveedor
     try:
-        # Enrutamiento directo a Zhipu AI (GLM-4, GLM-4-Flash, Kimi, Minimax, GLM 5.2)
-        if agent_type in ("glm", "flash", "kimi", "minimax", "glm52"):
-            zhipu_cfg = PROVIDER_CONFIG.get(agent_type, {})
-            zhipu_model = zhipu_cfg.get("model_name", "glm-4")
-            resultado = await call_zhipu_direct(
-                model=zhipu_model,
+        provider = PROVIDER_CONFIG.get(model, {}).get("provider", model)
+
+        # OpenAI (GPT-4o, GPT-4o-mini)
+        if model in ("openai", "openai-mini") or provider in ("openai", "openai-mini"):
+            if not openai_client:
+                raise HTTPException(status_code=500, detail="OpenAI no configurado. Falta OPENAI_API_KEY.")
+
+            openai_model = PROVIDER_CONFIG.get(model, {}).get("model_name", "gpt-4o")
+            openai_messages = []
+            if system_prompt:
+                openai_messages.append({"role": "system", "content": system_prompt})
+            for m in messages:
+                openai_messages.append({"role": m["role"], "content": m["content"]})
+
+            inicio = time.time()
+            response = await openai_client.chat.completions.create(
+                model=openai_model,
+                messages=openai_messages,
+                max_tokens=PROVIDER_CONFIG.get(model, {}).get("max_tokens", 4096),
+                temperature=PROVIDER_CONFIG.get(model, {}).get("temperature", 0.7),
+            )
+            duracion = round(time.time() - inicio, 2)
+
+            contenido = response.choices[0].message.content or ""
+            uso = response.usage
+
+            resultado = {
+                "content": contenido,
+                "model": openai_model,
+                "tokens_entrada": uso.prompt_tokens if uso else 0,
+                "tokens_salida": uso.completion_tokens if uso else 0,
+                "costo_usd": 0.0,
+                "tiempo_s": duracion,
+            }
+        else:
+            # DeepSeek, Claude, Gemini
+            resultado = await generar_respuesta_chat(
+                model=model,
                 messages=messages,
                 system_prompt=system_prompt,
             )
-            duracion_total = round(time.time() - t_inicio, 2)
-            return {
-                "content": resultado["content"],
-                "model": zhipu_model,
-                "tokens_entrada": resultado["tokens_entrada"],
-                "tokens_salida": resultado["tokens_salida"],
-                "costo_usd": 0.0,
-                "tiempo_s": duracion_total,
-            }
-
-        # Enrutamiento directo a TokenHub (Hy3) — unica ruta valida
-        if agent_type == "hunyuan":
-            hy3_cfg = PROVIDER_CONFIG.get("hunyuan", {})
-            prompt = ""
-            for m in reversed(messages):
-                if m["role"] == "user":
-                    prompt = m["content"]
-                    break
-            contenido = await call_tokenhub_direct(prompt=prompt, agent_config=agent_config)
-            duracion_total = round(time.time() - t_inicio, 2)
-            return {
-                "content": contenido,
-                "model": hy3_cfg.get("model_direct", "hy3"),
-                "tokens_entrada": 0,
-                "tokens_salida": 0,
-                "costo_usd": 0.0,
-                "tiempo_s": duracion_total,
-            }
-
-        # Cualquier otro caso (deepseek, claude, gemini)
-        resultado = await generar_respuesta_chat(
-            model=model,
-            messages=messages,
-            system_prompt=system_prompt,
-        )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except RuntimeError as e:
@@ -547,6 +455,7 @@ async def chat_endpoint(
 async def vision_inspect_endpoint(
     image: UploadFile = File(...),
     context: str = Form(""),
+    user: dict = Depends(verificar_acceso_premium),
 ):
     """
     Endpoint de inspección visual con IA.
@@ -597,7 +506,10 @@ async def vision_inspect_endpoint(
     messages = [
         {
             "role": "user",
-            "content": f"{user_prompt}\n\n[IMAGEN ADJUNTA EN BASE64 - {len(contenido)} bytes]",
+            "content": [
+                {"type": "text", "text": user_prompt},
+                {"type": "image_url", "image_url": {"url": data_uri}},
+            ],
         }
     ]
 
@@ -647,7 +559,10 @@ async def vision_inspect_endpoint(
 # ═══════════════════════════════════════════════════════════════════════════
 
 @app.post("/api/talent/calculate-ipa")
-async def talent_calculate_ipa(request: Request):
+async def talent_calculate_ipa(
+    request: Request,
+    user: dict = Depends(verificar_identidad),
+):
     """
     Calcula el Índice de Potencial Atenea (IPA) para un usuario.
     
@@ -695,7 +610,10 @@ async def talent_calculate_ipa(request: Request):
 
 
 @app.post("/api/talent/match")
-async def talent_match(request: Request):
+async def talent_match(
+    request: Request,
+    user: dict = Depends(verificar_acceso_premium),
+):
     """
     Matching semántico de talento usando DeepSeek.
     Evalúa potencial, NO años de experiencia.
@@ -736,7 +654,10 @@ async def talent_match(request: Request):
 
 
 @app.post("/api/talent/validate-skill")
-async def talent_validate_skill(request: Request):
+async def talent_validate_skill(
+    request: Request,
+    user: dict = Depends(verificar_acceso_premium),
+):
     """
     Valida una habilidad demostrada por un trabajador usando IA.
     Si aprueba, otorga un "Sello de Habilidad" que sube el IPA.
@@ -796,7 +717,11 @@ async def talent_roles_catalog():
 # ═══════════════════════════════════════════════════════════════════════════
 
 @app.post("/api/webhooks/whatsapp")
-async def whatsapp_webhook(request: Request):
+@limiter.limit("10/minute")
+async def whatsapp_webhook(
+    request: Request,
+    user: dict = Depends(verificar_identidad),
+):
     """
     Webhook para recibir mensajes de WhatsApp (Twilio/Meta API).
     Procesa texto e imágenes desde el campo y los estructura como reportes.
@@ -837,11 +762,22 @@ async def whatsapp_webhook(request: Request):
     if image_url:
         try:
             import urllib.request
+            from urllib.parse import urlparse
 
-            # Descargar imagen desde URL
+            parsed = urlparse(image_url)
+            hostname = (parsed.hostname or "").lower()
+
+            if parsed.scheme not in ("https",):
+                raise HTTPException(status_code=422, detail="Solo se permiten URLs HTTPS.")
+
+            blocked = ("127.", "10.", "192.168.", "172.", "169.254.", "0.", "localhost",
+                       "169.254.169.254", "metadata.google.internal")
+            if any(hostname.startswith(p) or hostname == p for p in blocked):
+                raise HTTPException(status_code=422, detail="URL no permitida.")
+
             req = urllib.request.Request(image_url, headers={"User-Agent": "AteneaLab/1.0"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                img_bytes = resp.read()
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                img_bytes = resp.read(5 * 1024 * 1024)
 
             img_b64 = base64.b64encode(img_bytes).decode("utf-8")
             context = message_body or "Reporte de campo vía WhatsApp"

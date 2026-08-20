@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 # Claude: modelo conversacional más capaz que Haiku (uso Premium)
 # No modificamos MODELO_HAIKU de main.py — este es un modelo distinto para chat
-MODELO_CLAUDE_CHAT = "claude-sonnet-4-6"
+MODELO_CLAUDE_CHAT = "claude-sonnet-5"
 
 # Gemini: mismo modelo validado en abogado_stps.py (gemini-2.5-flash)
 MODELO_GEMINI_CHAT = "gemini-2.5-flash"
@@ -324,15 +324,10 @@ async def llamar_deepseek(messages: List[Dict[str, str]], system_prompt: str = "
 # DESPACHADOR UNIFICADO
 # ═══════════════════════════════════════════════════════════════════════════
 
-# GLM y Hunyuan van por OpenRouter
-from agents_config import call_open_router, PROVIDER_CONFIG
-
 MODELOS_VALIDOS = {
     "claude": (llamar_claude, MODELO_CLAUDE_CHAT),
     "gemini": (llamar_gemini, MODELO_GEMINI_CHAT),
     "deepseek": (llamar_deepseek, MODELO_DEEPSEEK_CHAT),
-    "glm": (None, PROVIDER_CONFIG["glm"]["model_name"]),      # OpenRouter
-    "hunyuan": (None, PROVIDER_CONFIG["hunyuan"]["model_name"]),  # OpenRouter
 }
 
 
@@ -372,11 +367,7 @@ async def generar_respuesta_chat(
     funcion, nombre_modelo = MODELOS_VALIDOS[modelo_lower]
     logger.info("📤 Despachando chat → %s (%s)", modelo_lower, nombre_modelo)
 
-    # Si es GLM o Hunyuan, usar OpenRouter
-    if modelo_lower in ("glm", "hunyuan"):
-        resultado = await call_open_router(nombre_modelo, messages, system_prompt)
-    else:
-        resultado = await funcion(messages, system_prompt)
+    resultado = await funcion(messages, system_prompt)
 
     resultado["model"] = nombre_modelo
     return resultado
